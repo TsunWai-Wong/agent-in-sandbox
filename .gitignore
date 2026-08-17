@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+uv.lock
+
+# Virtual environments
+.venv
+
+# genai-bench output (plots, xlsx, per-run json)
+bench_results/
+genai_bench.log
+
+# per-model server logs from benchmarking.py
+bench_logs/
