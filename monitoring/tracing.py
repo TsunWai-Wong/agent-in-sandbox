@@ -39,7 +39,7 @@ def setup_tracing(project_name: str = PROJECT_NAME) -> None:
 
     from phoenix.otel import register
 
-    register(project_name=project_name, auto_instrument=True)
+    register(project_name=project_name, auto_instrument=True, protocol="http/protobuf")
     logger.info(
         "Tracing enabled: project '%s' -> %s",
         project_name,

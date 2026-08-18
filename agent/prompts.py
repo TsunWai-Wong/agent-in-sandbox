@@ -3,7 +3,7 @@ class Prompt:
     def get_agent_instruction(cls):
         return """
 You're a expert assistant.
-
+Keep trying when there is an error.
 """
 
     @classmethod
