@@ -38,13 +38,3 @@ class ModelProviderRegistry:
 
 registry = ModelProviderRegistry()
 registry.register("openai", OpenAIProvider)
-
-# Gemini is registered only when its SDK is importable, so an environment that
-# installed the OpenAI path alone still gets a working registry instead of an
-# ImportError from a provider it never asked for.
-try:
-    from .gemini_provider import GeminiProvider
-except ImportError:
-    logger.debug("google-genai is not installed; the gemini provider is unavailable.")
-else:
-    registry.register("gemini", GeminiProvider)

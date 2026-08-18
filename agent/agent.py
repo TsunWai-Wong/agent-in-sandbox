@@ -2,7 +2,7 @@ import json
 
 from openinference.semconv.trace import SpanAttributes
 
-from src.monitoring import get_tracer
+from monitoring import get_tracer
 
 from .context_assembler import ContextAssembler
 from .llm_service import LLMService
@@ -15,7 +15,7 @@ tracer = get_tracer(__name__)
 class AgentLoopError(Exception):
     pass
 
-class RAGAgent:
+class Agent:
     tools: ToolRegistry
     llm: LLMService
     context: ContextAssembler

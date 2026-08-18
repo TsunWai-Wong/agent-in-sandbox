@@ -1,0 +1,14 @@
+services:
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: phoenix-agent-in-sandbox
+    environment:
+      - PHOENIX_WORKING_DIR=/mnt/data
+    ports:
+      - "6006:6006"   # UI and OTLP HTTP collector
+      - "4317:4317"   # OTLP gRPC collector
+    volumes:
+      - phoenix_data:/mnt/data
+
+volumes:
+  phoenix_data:

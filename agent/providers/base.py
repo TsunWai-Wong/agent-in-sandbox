@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.agent.tool_registry import ToolSchema
+from agent.tool_registry import ToolSchema
 
 
 class ToolCall(BaseModel):

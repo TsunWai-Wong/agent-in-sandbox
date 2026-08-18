@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark several models through server.py, one after another.
+"""Benchmark several models through agent/providers/server.py, one after another.
 
 RUN
 ---
-    uvx --from genai-bench --with datasets python benchmarking.py
+    uvx --from genai-bench --with datasets python benchmark/benchmarking.py
 
 `--with datasets` is what benchmark_intelligence needs to pull GSM8K, MMLU and
 ARC-Easy; benchmark_performance alone does not require it.
@@ -46,12 +46,17 @@ from genai_bench.cli.cli import benchmark
 
 HERE = Path(__file__).resolve().parent
 
+# This module lives in benchmark/, so the project it benchmarks is one level up.
+# The server script and the `uv run` cwd resolve against the root; the log and
+# results folders stay next to this file, inside benchmark/.
+PROJECT_ROOT = HERE.parent
+
 # One point per concurrency level along each curve, one curve per traffic
 # scenario. Leave either list at a single value and the plots come out as a
 # single dot with nothing to read.
 #
 # A caution specific to this server: it is serialized (MLX is single-stream and
-# server.py admits one request at a time on request_lock), so sweeping
+# Server admits one request at a time on request_lock), so sweeping
 # concurrency does not buy throughput. RPS stays roughly flat while latency
 # climbs -- a queueing curve, not a capacity curve. Varying the scenarios is
 # the more informative axis here, since input/output token counts genuinely
@@ -64,7 +69,7 @@ INTELLIGENCE_TASKS = ("gsm8k", "mmlu", "arc-easy")
 
 
 class Benmarking:
-    """Runs genai-bench against server.py for each model in turn.
+    """Runs genai-bench against agent/providers/server.py for each model in turn.
 
     Usage:
         bench = Benmarking(["mlx-community/gemma-4-E2B-it-4bit", ...])
@@ -76,7 +81,7 @@ class Benmarking:
                  *,
                  port: int = 8080,
                  server_script: Optional[Path] = None,
-                 results_dir: str = "bench_results",
+                 results_dir: Optional[Path] = None,
                  log_dir: Optional[Path] = None,
                  startup_timeout: float = 600.0,
                  answer_timeout: float = 300.0):
@@ -89,8 +94,13 @@ class Benmarking:
 
         self.port = port
         self.base_url = f"http://127.0.0.1:{port}"
-        self.server_script = Path(server_script or HERE / "server.py")
-        self.results_dir = results_dir
+        self.server_script = Path(
+            server_script or PROJECT_ROOT / "agent" / "providers" / "server.py"
+        )
+        # Anchored to this file, not the process cwd. `make benchmark` runs from
+        # the project root, and a cwd-relative default would scatter genai-bench
+        # output there instead of into benchmark/bench_results.
+        self.results_dir = str(results_dir or HERE / "bench_results")
         self.log_dir = Path(log_dir or HERE / "bench_logs")
         self.startup_timeout = startup_timeout
         # Per-question ceiling for benchmark_intelligence. The first
@@ -114,7 +124,7 @@ class Benmarking:
     # ---------------------------------------------------------------- server
 
     def _start_server(self, model: str) -> None:
-        """Bring up server.py serving `model`, replacing any current server."""
+        """Bring up the Server serving `model`, replacing any current one."""
         if self._serving == model and self._server_alive():
             return
 
@@ -135,7 +145,7 @@ class Benmarking:
         with open(log_path, "wb") as log:
             self._proc = subprocess.Popen(
                 ["uv", "run", "python", str(self.server_script)],
-                cwd=str(HERE),
+                cwd=str(PROJECT_ROOT),
                 env=env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -377,7 +387,8 @@ class Benmarking:
         except ImportError as exc:
             raise RuntimeError(
                 "benchmark_intelligence needs the `datasets` package. Run with: "
-                "uvx --from genai-bench --with datasets python benchmarking.py"
+                "uvx --from genai-bench --with datasets python "
+                "benchmark/benchmarking.py"
             ) from exc
 
         source = {

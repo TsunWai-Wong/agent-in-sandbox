@@ -11,7 +11,7 @@ from opentelemetry import trace
 logger = logging.getLogger(__name__)
 
 DEFAULT_COLLECTOR_ENDPOINT = "http://localhost:6006"
-PROJECT_NAME = "lyrics-rag"
+PROJECT_NAME = "agent-in-sandbox"
 
 # Fields worth showing per retrieved document. Lyrics are deliberately absent:
 # a single query fans out to ~40 documents across three spans, and full lyrics

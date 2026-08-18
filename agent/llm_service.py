@@ -6,7 +6,7 @@ from typing import Any
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from src.agent.tool_registry import ToolSchema
+from agent.tool_registry import ToolSchema
 
 from .providers import ChatResponse, Provider, ToolResult, registry
 

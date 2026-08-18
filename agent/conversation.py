@@ -3,9 +3,9 @@ import os
 
 from dotenv import load_dotenv
 
-from src.agent.prompts import Prompt
-from src.agent.providers import Usage
-from src.agent.rag_agent import RAGAgent
+from agent.prompts import Prompt
+from agent.providers import Usage
+from agent.agent import Agent
 
 
 logger = logging.getLogger(__name__)
@@ -34,13 +34,13 @@ class Conversation:
     whichever model is answering.
     """
 
-    agent: RAGAgent
+    agent: Agent
     history: list
     last_usage: Usage | None
 
     def __init__(
         self,
-        agent: RAGAgent,
+        agent: Agent,
         token_budget: int = DEFAULT_TOKEN_BUDGET,
         evict_threshold: float = EVICT_THRESHOLD,
         compress_threshold: float = COMPRESS_THRESHOLD,
