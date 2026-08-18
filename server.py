@@ -38,7 +38,7 @@ INSTALL (macOS 15+, Apple silicon)
 
 RUN
 ---
-    python gemma4_mlx_server.py
+    python server.py
     # -> http://127.0.0.1:8080/v1
 
 THREE SPOTS TO VERIFY AGAINST YOUR INSTALLED VERSIONS

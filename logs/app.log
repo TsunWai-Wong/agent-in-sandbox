@@ -1,0 +1,5 @@
+2026-08-17 14:49:26 | INFO | Starting server on 0.0.0.0:8080
+2026-08-17 14:49:26 | INFO | Server configuration complete.
+2026-08-17 14:49:26 | INFO | Starting Uvicorn server...
+2026-08-17 14:49:26 | INFO | Initializing MLX handler with model path: mlx-community/gemma-4-e2b-it-4bit
+2026-08-17 14:49:26 | ERROR | Failed to initialize MLX handler: Error loading model: Model type gemma4 not supported.
