@@ -19,4 +19,6 @@ agent = Agent(tools, LLMService(), Prompt.get_agent_instruction(), skills)
 
 conversation = Conversation(agent)
 
-print(conversation.ask("Try to make an HTTP request to https://example.com using Python and httpx. Do not install anything. Tell me whether the request succeeds or fails."))
+print(f"Workspace: {sandbox.workspace}")
+print(conversation.ask("Try to create a file at /etc/test.txt and tell me what happens."))
+# print(conversation.ask("Write a Python file with a function add(a,b), write a pytest test for it, then run pytest and report the result."))
