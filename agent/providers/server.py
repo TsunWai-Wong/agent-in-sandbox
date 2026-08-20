@@ -89,9 +89,21 @@ from pydantic import BaseModel
 # weights in 8 GB at once.
 MODEL_ID = os.environ.get("MODEL_ID", "mlx-community/gemma-4-E2B-it-4bit")
 
-# E2B advertises a 128K window. Do NOT let the KV cache grow to that on an Air.
-# A rotating cache of 4096 keeps memory flat; raise it if you need more recall.
-MAX_KV_SIZE = 4096
+# E2B advertises a 128K window. Do NOT let the KV cache grow to that on an Air,
+# but 4096 was far more cautious than this architecture needs. E2B is MQA (one
+# KV head) and 28 of its 35 layers are sliding_attention pinned to a 512-token
+# window by the config, so those cost a flat ~15 MB whatever this is set to.
+# Only the 7 full_attention layers scale with it, at ~14 KB per token:
+#
+#     4096 ->  73 MB     16384 -> 250 MB     65536 -> 954 MB
+#
+# 4096 was the real constraint on browser work rather than memory: one Hacker
+# News snapshot is ~2.4-3.2K tokens, so a single tool result filled the cache
+# and the rotating window then evicted the system instruction and the user's
+# question. 16384 holds ~5 snapshots for 250 MB, which an 8 GB Air can spare
+# next to ~2 GB of weights. Prefill time grows with it, so raise further only
+# if recall is still the thing that hurts.
+MAX_KV_SIZE = int(os.environ.get("MAX_KV_SIZE", 16384))
 
 DEFAULT_MAX_TOKENS = 1024
 
