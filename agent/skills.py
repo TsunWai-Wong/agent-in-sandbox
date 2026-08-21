@@ -32,11 +32,29 @@ class Skill(BaseModel):
 class SkillRegistry:
     """Registry with on-demand skill loading."""
 
-    def __init__(self, skills_dir: str | Path):
+    def __init__(self, skills_dir: str | Path, catalog: dict[str, Skill] | None = None):
         self.skills_dir = Path(skills_dir)
-        self._catalog: dict[str, Skill] = {}
+        # An inherited catalog is a fork's (see below); scanning is skipped
+        # because the disk was already read once to build it.
+        self._catalog: dict[str, Skill] = {} if catalog is None else catalog
         self._active: dict[str, Skill] = {}
-        self._scan()
+        if catalog is None:
+            self._scan()
+
+    def fork(self) -> "SkillRegistry":
+        """A registry over the same catalog, with nothing loaded.
+
+        What cannot be shared between concurrent sessions is _active: the
+        assembler rebuilds the instruction from it on every request, so one
+        session's load_skill would appear in another's instructions mid-loop.
+        The catalog underneath is read-only after the scan, so there is no
+        reason for each session to pay for its own copy.
+
+        Constructing a second SkillRegistry does the same job, but it re-reads
+        every SKILL.md off disk. Forking is what makes a per-session registry
+        cheap enough to build on every scheduled run.
+        """
+        return SkillRegistry(self.skills_dir, catalog=self._catalog) # use the same _catalog, but has a new _active
 
     def _scan(self):
         """Scan the skills directory and build the catalog."""
