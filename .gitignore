@@ -16,3 +16,6 @@ genai_bench.log
 
 # per-model server logs from benchmarking.py
 bench_logs/
+
+# scheduler run bookkeeping (SQLite, plus its WAL sidecars)
+scheduler.db*
