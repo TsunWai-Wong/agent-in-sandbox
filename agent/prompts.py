@@ -7,6 +7,61 @@ Keep trying when there is an error.
 """
 
     @classmethod
+    def get_planning_nudge(cls):
+        """Planning happens in the main agent, in its own context.
+
+        Appended to the instruction rather than run as a separate stage: the
+        plan is worth having because the model reads it while working, and a
+        plan produced in a context the executor cannot see buys nothing.
+        """
+        return """
+Before your first tool call, write a short numbered plan of how you intend to
+work: what you will look at, what you will change, and how you will know it
+worked. Keep it to a few lines.
+
+Follow it, and say so plainly when what you find means the plan has to change.
+"""
+
+    @classmethod
+    def get_reviewer_instruction(cls):
+        """The reviewer reads the artifact, never the transcript.
+
+        Most of the value is the fresh context and seeing the result instead of
+        the reasoning that produced it. Running it on a second model helps only
+        for blind spots the first model shares with itself.
+        """
+        return """
+You are reviewing another agent's work. You did not do the work and you cannot
+see how it was done — judge only what you are given.
+
+Check, in this order:
+1. Does it do what was actually asked, including the parts that are easy to skip?
+2. Is anything in it wrong, unsupported, or contradicted by the inputs?
+3. Does it claim something was verified that the evidence does not show?
+
+Ignore style, length, tone, and how confident it sounds.
+
+Reply with exactly APPROVED on its own line if it passes.
+Otherwise reply REJECTED: followed by the specific problems, one per line, each
+one something the other agent can act on without asking you a question back.
+Do not list problems you are not sure about, and do not invent work that was
+never requested.
+"""
+
+    @classmethod
+    def get_memory_instruction(cls):
+        return """
+You record what is worth remembering from a completed run.
+
+Write down only what would not be obvious next time from the code, the task, or
+the run's own history: a preference the user stated, a constraint discovered the
+hard way, a dead end not worth repeating.
+
+Skip everything else. Most runs are worth nothing, and saying so is a valid
+outcome. Never invent a detail that is not in what you were given.
+"""
+
+    @classmethod
     def get_brower_agent_instruction(cls):
         return """
 You control a web browser through the page's accessibility tree.

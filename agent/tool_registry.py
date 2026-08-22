@@ -66,6 +66,15 @@ class Tool(BaseModel):
     name: str
     tool_schema: ToolSchema
     handler: Callable
+    # Whether dispatch should hand this handler the current RunState. Kept off
+    # the generated schema so run plumbing never appears in what the model reads.
+    wants_state: bool = False
+
+
+# The parameter a run-aware handler receives the RunState through. Excluded from
+# the schema, so a sub-agent tool can reach the ledger without the model ever
+# being offered a "state" argument to hallucinate a value for.
+STATE_PARAM = "state"
 
 class ToolRegistry:
     tools: dict[str, Tool]
@@ -102,13 +111,15 @@ class ToolRegistry:
 
         return summary, param_docs
 
-    def _read_tool(self, handler: Callable) -> dict:
+    def _read_tool(self, handler: Callable, wants_state: bool = False) -> dict:
         """Build a tool schema from a handler's signature and docstring."""
         summary, param_docs = self._parse_docstring(inspect.getdoc(handler) or "")
         hints = get_type_hints(handler)
 
         properties, required = {}, []
         for name, param in inspect.signature(handler).parameters.items():
+            if wants_state and name == STATE_PARAM:
+                continue
             hint = hints.get(name, str)
             origin = get_origin(hint) or hint
             properties[name] = {
@@ -135,29 +146,48 @@ class ToolRegistry:
             },
         }
 
-    def register(self, name: str, handler: Callable):
+    def register(self, name: str, handler: Callable, wants_state: bool = False):
         """Register a callable, validating its generated schema first.
 
         Raises pydantic.ValidationError if the handler's signature or
         docstring produce an invalid tool schema, so a broken tool fails
         at registration time instead of inside the agent loop.
+
+        Set wants_state for a handler that needs the run it is part of — a
+        sub-agent tool needs the ledger for its depth check and its token
+        rollup. The parameter is stripped from the schema, so the model is
+        never offered it.
         """
-        schema = self._read_tool(handler)
+        schema = self._read_tool(handler, wants_state)
         schema["name"] = name  # the registry name is authoritative for dispatch
         tool_schema = ToolSchema.model_validate(schema)
-        self.tools[name] = Tool(name=name, tool_schema=tool_schema, handler=handler)
+        self.tools[name] = Tool(
+            name=name,
+            tool_schema=tool_schema,
+            handler=handler,
+            wants_state=wants_state,
+        )
 
     def get_schemas(self) -> list[ToolSchema]:
         """Return neutral schemas for the provider to convert."""
         return [tool.tool_schema for tool in self.tools.values()]
 
-    def dispatch(self, name: str, arguments: dict) -> str:
-        """Execute a tool call and return the result as a string."""
+    def dispatch(self, name: str, arguments: dict, state=None) -> str:
+        """Execute a tool call and return the result as a string.
+
+        Only genuine failures come back as "Error:" here. A call refused by
+        policy never reaches this method — the loop short-circuits it at the
+        before_tool seam — so a denial and a crash stay distinguishable without
+        the caller having to parse strings to tell them apart.
+        """
         tool = self.tools.get(name)
         if not tool:
             return f"Error: Unknown tool '{name}'"
         try:
-            result = tool.handler(**arguments)
+            if tool.wants_state:
+                result = tool.handler(**arguments, **{STATE_PARAM: state})
+            else:
+                result = tool.handler(**arguments)
             return str(result)
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
