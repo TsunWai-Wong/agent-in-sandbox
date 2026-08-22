@@ -7,9 +7,16 @@ WHAT IT DOES
 ------------
 POST /v1/chat/completions
 
+  "messages": [{"role": "user", "content": [
+      {"type": "text", "text": "..."},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]
+      Image input. Gemma 4 is multimodal and the 4-bit checkpoints ship the
+      vision tower, but mlx-lm loads the text path only -- which is why this
+      file is built on mlx-vlm instead.
+
   "tools": [...]
       Native Gemma 4 tool calling. The model is prompted through its own chat
-      template, and the reply is parsed with mlx-lm's built-in gemma4 parser.
+      template, and the reply is parsed with mlx-vlm's built-in gemma4 parser.
       If that parse fails, the request is retried with constrained decoding so
       you always get a well-formed tool call back.
 
@@ -23,11 +30,20 @@ WHY THIS SHAPE
 Tool calling and structured output are the same problem: force the decoder to
 only emit tokens a grammar allows. One model in memory, two entry points.
 
-  - Unconstrained path -> mlx_lm.generate       (fast, in-distribution)
-  - Constrained path   -> outlines.from_mlxlm   (guaranteed valid)
+  - Unconstrained path -> mlx_vlm.stream_generate
+  - Constrained path   -> the same call, plus an llguidance logits processor
 
-Outlines wraps the *already loaded* mlx-lm model object, so there is only ever
-one copy of the weights in RAM. That matters on an 8 GB Air.
+Both paths run the same loaded model; constraining is a logits processor rather
+than a second wrapper object, so there is only ever one copy of the weights in
+RAM. That matters on an 8 GB Air.
+
+WHY NOT OUTLINES
+----------------
+Outlines wrapped the mlx-lm model object and does not take a VLM. mlx-vlm ships
+its own schema-to-grammar path built on llguidance, which lands in the same
+place -- a logits mask that makes invalid tokens unreachable -- and already
+handles image inputs. That is the one part of this file that was replaced
+rather than ported.
 
 WHY A CLASS
 -----------
@@ -40,10 +56,16 @@ costs RAM.
 
 INSTALL (macOS 15+, Apple silicon)
 ----------------------------------
-    pip install "mlx-lm>=0.31.3" "outlines>=1.0" fastapi uvicorn pydantic
+    pip install "mlx-vlm>=0.6.15" fastapi uvicorn pydantic
 
-    Pin these. Both mlx-lm's sampling API and Outlines' top-level API have
-    changed shape between releases.
+    Pin the floor. mlx-vlm 0.5.0 cannot load these weights at all: Gemma 4 sets
+    num_kv_shared_layers=20, so layers 15-34 carry no k_proj/v_proj, and 0.5.0
+    built all 35 layers with full projections and then demanded 60 tensors the
+    checkpoint does not contain. llguidance arrives as a dependency of mlx-vlm;
+    outlines is no longer needed.
+
+    mlx-vlm is a community project (Blaizzy/Prince Canuma), not Apple's like
+    mlx and mlx-lm are. Test before upgrading it.
 
 RUN
 ---
@@ -52,12 +74,11 @@ RUN
     python -m agent.providers.server
     # -> http://127.0.0.1:8080/v1
 
-THREE SPOTS TO VERIFY AGAINST YOUR INSTALLED VERSIONS
------------------------------------------------------
+TWO SPOTS TO VERIFY AGAINST YOUR INSTALLED VERSIONS
+----------------------------------------------------
 Marked [VERIFY] in the code below. They are the version-sensitive bits:
   1. the tool-parser import path
-  2. the Outlines raw-JSON-schema helper
-  3. the chat template's thinking-mode kwarg
+  2. the chat template's thinking-mode kwarg
 """
 
 import asyncio
@@ -68,12 +89,13 @@ import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
-import mlx_lm
-import outlines
+import mlx_vlm
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from mlx_lm.sample_utils import make_sampler
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.sample_utils import make_sampler
+from mlx_vlm.structured import build_json_schema_logits_processor
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
@@ -119,12 +141,13 @@ STRUCTURED_SAMPLING = dict(temp=0.0)
 HOST, PORT = "127.0.0.1", int(os.environ.get("PORT", 8080))
 
 
-# [VERIFY 1] Tool parser location. In mlx-lm 0.31.x this is:
-#     mlx_lm/tool_parsers/gemma4.py :: parse_tool_call(text, tools)
-# It is semi-internal and has moved before. Check with:
-#     python -c "import mlx_lm.tool_parsers as t; print(dir(t))"
+# [VERIFY 1] Tool parser location. In mlx-vlm 0.6.x this is:
+#     mlx_vlm/tool_parsers/gemma4.py :: parse_tool_call(text, tools=None)
+# Same shape as the mlx-lm parser this used to import, so the call site below
+# did not change. It is semi-internal and has moved before. Check with:
+#     python -c "import mlx_vlm.tool_parsers as t; print(dir(t))"
 try:
-    from mlx_lm.tool_parsers import gemma4 as gemma4_parser
+    from mlx_vlm.tool_parsers import gemma4 as gemma4_parser
 except ImportError:
     gemma4_parser = None
     print("warning: gemma4 tool parser not found; tool calls will always "
@@ -182,9 +205,20 @@ class Server:
 
         # ---- Load once, share everywhere --------------------------------
         print(f"loading {model_id} ...")
-        self.model, self.tokenizer = mlx_lm.load(model_id)
+        # mlx-vlm returns a *processor*, not a tokenizer: the object that knows
+        # how to turn pixels into patches as well as text into ids. The text
+        # tokenizer hangs off it, and the two are needed in different places --
+        # the processor for prompting and generation, the tokenizer for token
+        # counts and for the grammar.
+        self.model, self.processor = mlx_vlm.load(model_id)
+        self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
 
-        # Register the tokenizer's own declared EOS. mlx-lm seeds its stop set
+        # The chat template needs the model config to know how many image
+        # placeholder tokens one image expands to (280 for E2B, per
+        # vision_soft_tokens_per_image in config.json).
+        self.config = self.model.config
+
+        # Register the tokenizer's own declared EOS. The stop set is seeded
         # from the chat template's end-of-turn token, which is not always
         # eos_token -- Phi-4-mini ends turns with <|end|> but declares
         # <|endoftext|>. When such a model emits its eos_token nothing stops
@@ -192,11 +226,12 @@ class Server:
         # are detokenized into the reply as literal text, e.g.
         #     { "answer": "B" }<|endoftext|><|endoftext|>...
         # which breaks any client calling model_validate_json() on the result.
-        if getattr(self.tokenizer, "eos_token", None):
-            self.tokenizer.add_eos_token(self.tokenizer.eos_token)
-
-        # Same weights, second interface. No extra RAM.
-        self.constrained_model = outlines.from_mlxlm(self.model, self.tokenizer)
+        #
+        # mlx-vlm spells this add_eos_token_ids() and wants ids, where mlx-lm
+        # took the token string. Guarded because it is not on every processor.
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None and hasattr(self.tokenizer, "add_eos_token_ids"):
+            self.tokenizer.add_eos_token_ids(eos_token_id)
 
         # MLX generation is single-stream. Serialize requests or you will get
         # interleaved garbage and confusing Metal errors under concurrency.
@@ -248,24 +283,80 @@ class Server:
         Passing `tools` here is what puts the model in-distribution for tool
         calling -- the template injects the schemas in the exact format the
         model saw during training. Do not hand-roll this into a system prompt.
+
+        Images do not travel through here. The template only reserves *slots*
+        for them -- num_images placeholder tokens in the right positions -- and
+        the pixels are passed separately to the generate call. Splitting it
+        this way is mlx-vlm's contract, and it is why images_from() below has
+        to walk the same message list a second time.
         """
-        kwargs: Dict[str, Any] = dict(
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+        kwargs: Dict[str, Any] = dict(add_generation_prompt=True)
         if tools:
             kwargs["tools"] = tools
 
-        # The conversation is positional. HF names that parameter
-        # `conversation`, not `messages`, and mlx-lm's TokenizerWrapper
-        # forwards *args through untouched -- so passing messages=... raises
-        # "missing 1 required positional argument: 'conversation'".
-        #
-        # [VERIFY 3] resolved: mlx-lm's wrapper takes `enable_thinking` and
-        # defaults it to tokenizer.has_thinking, so this kwarg is always safe.
-        return self.tokenizer.apply_chat_template(
-            self._decode_tool_arguments(messages), **kwargs,
-            enable_thinking=thinking)
+        prepared = self._decode_tool_arguments(messages)
+
+        # [VERIFY 2] mlx-vlm forwards **kwargs down to the tokenizer's own
+        # apply_chat_template, so `enable_thinking` reaches Gemma 4's template
+        # the same way it did under mlx-lm.
+        return apply_chat_template(
+            self.processor,
+            self.config,
+            self._flatten_content(prepared),
+            num_images=len(self.images_from(messages)),
+            enable_thinking=thinking,
+            **kwargs,
+        )
+
+    @staticmethod
+    def images_from(messages: List[Dict[str, Any]]) -> List[str]:
+        """Collect every image in the conversation, oldest first.
+
+        Returned as the raw url strings. mlx-vlm's load_image() already
+        understands a `data:image/...;base64,` URI as well as a path or an
+        http(s) URL, so nothing here has to decode anything -- which is most of
+        the reason this function is six lines instead of sixty.
+
+        Order matters: the Nth placeholder in the prompt binds to the Nth image
+        in this list, so a stable walk over the messages is the whole contract.
+        """
+        images: List[str] = []
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url")
+                    if url:
+                        images.append(url)
+        return images
+
+    @staticmethod
+    def _flatten_content(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Reduce multimodal content lists to the plain text the template wants.
+
+        The image parts are dropped rather than rendered: build_prompt() has
+        already told the template how many images there are, and letting a
+        `{'type': 'image_url', ...}` dict reach the template would render it as
+        literal text next to the placeholder the template inserted -- the model
+        would see the same image announced twice, once as a slot and once as
+        JSON debris.
+        """
+        flattened: List[Dict[str, Any]] = []
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                flattened.append(message)
+                continue
+
+            text = " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+            flattened.append({**message, "content": text})
+        return flattened
 
     @staticmethod
     def _decode_tool_arguments(
@@ -318,23 +409,6 @@ class Server:
     # ----------------------------------------------------- schema helpers
 
     @staticmethod
-    def as_output_type(schema: Dict[str, Any]):
-        """Turn a raw JSON schema dict into something Outlines can constrain on.
-
-        [VERIFY 2] Outlines v1 exposes `outlines.json_schema(...)`; some builds
-        expose `outlines.types.JsonSchema(...)`. Both are tried here.
-
-        Note: clients pass Pydantic models as MyModel.model_json_schema(), so
-        the server never needs to import the client's Pydantic classes. That
-        keeps the server generic -- it only ever speaks JSON Schema.
-        """
-        try:
-            return outlines.json_schema(schema)
-        except AttributeError:
-            from outlines.types import JsonSchema
-            return JsonSchema(schema)
-
-    @staticmethod
     def tools_to_union_schema(tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Build one schema that matches a call to any of the supplied tools.
 
@@ -377,56 +451,59 @@ class Server:
             "total_tokens": prompt_tokens + completion_tokens,
         }
 
-    def constrained_usage(self, prompt: str, text: str) -> Dict[str, int]:
-        """Token counts for the constrained path.
+    def generate(self, prompt: str, max_tokens: int,
+                 *,
+                 images: Optional[List[str]] = None,
+                 schema: Optional[Dict[str, Any]] = None,
+                 temperature: Optional[float] = None
+                 ) -> Tuple[str, Dict[str, int]]:
+        """Generate a reply, optionally constrained to `schema`.
 
-        Outlines hands back only the finished string, so these are recovered by
-        re-encoding instead of read off the decoder. Fine for accounting; do
-        not treat them as exact the way the free path's counts are.
+        The free and constrained paths were two functions under Outlines
+        because Outlines needed its own wrapper object around the model. With
+        llguidance the only difference is one extra logits processor, so they
+        are one function -- and constrained generation now reports the same
+        exact token counts the free path always did, instead of re-encoding.
+
+        Built on stream_generate rather than generate because each response
+        carries exact prompt_tokens/generation_tokens counts.
         """
-        return self.usage_block(len(self.tokenizer.encode(prompt)),
-                                len(self.tokenizer.encode(text)))
+        kwargs: Dict[str, Any] = dict(
+            max_tokens=max_tokens,
+            max_kv_size=self.max_kv_size,
+            # mlx-vlm defaults this to False and hands back special tokens as
+            # literal text, so a reply arrives as "Red<bos>" -- which breaks
+            # model_validate_json() on the constrained path and looks like a
+            # model fault rather than a detokenizer setting. mlx_vlm.server
+            # passes True for the same reason.
+            skip_special_tokens=True,
+        )
 
-    def generate_free(self, prompt: str, max_tokens: int,
-                      temperature: Optional[float] = None
-                      ) -> Tuple[str, Dict[str, int]]:
-        """Normal, unconstrained generation. Returns (text, usage).
+        if schema is None:
+            kwargs["sampler"] = self.sampler_for(temperature)
+        else:
+            # The grammar decides what is legal; sampling entropy on top of it
+            # only buys worse values inside the same shape.
+            kwargs["sampler"] = make_sampler(**STRUCTURED_SAMPLING)
+            # Built per request, not cached: the processor carries the walk
+            # position through the grammar, so reusing one across requests
+            # would resume mid-schema.
+            kwargs["logits_processors"] = [
+                build_json_schema_logits_processor(self.tokenizer, schema)
+            ]
 
-        Built on stream_generate rather than generate because each
-        GenerationResponse carries exact prompt_tokens/generation_tokens
-        counts. Detokenizing and re-encoding to count them instead is slower
-        and not always round-trip accurate.
-        """
         pieces: List[str] = []
         prompt_tokens = completion_tokens = 0
         with self.gpu_lock:
-            for r in mlx_lm.stream_generate(
-                self.model, self.tokenizer, prompt,
-                max_tokens=max_tokens,
-                sampler=self.sampler_for(temperature),
-                max_kv_size=self.max_kv_size,
+            for r in mlx_vlm.stream_generate(
+                self.model, self.processor, prompt,
+                image=images or None,
+                **kwargs,
             ):
                 pieces.append(r.text)
                 prompt_tokens = r.prompt_tokens
                 completion_tokens = r.generation_tokens
         return "".join(pieces), self.usage_block(prompt_tokens, completion_tokens)
-
-    def generate_constrained(self, prompt: str, schema: Dict[str, Any],
-                             max_tokens: int) -> str:
-        """Grammar-constrained generation. Output is guaranteed to match `schema`."""
-        output_type = self.as_output_type(schema)
-        with self.gpu_lock:
-            # Outlines passes **kwargs straight through to mlx_lm.generate,
-            # which forwards them to generate_step -- and generate_step takes
-            # `sampler`, not `temp`. Splatting STRUCTURED_SAMPLING here raises
-            # TypeError.
-            return self.constrained_model(
-                prompt,
-                output_type,
-                max_tokens=max_tokens,
-                sampler=make_sampler(**STRUCTURED_SAMPLING),
-                max_kv_size=self.max_kv_size,
-            )
 
     # ------------------------------------------------------ wire envelopes
 
@@ -483,7 +560,8 @@ class Server:
     def sse(body: Dict[str, Any]) -> str:
         return f"data: {json.dumps(body)}\n\n"
 
-    async def sse_chat(self, prompt: str, req: ChatRequest) -> AsyncIterator[str]:
+    async def sse_chat(self, prompt: str, req: ChatRequest,
+                       images: Optional[List[str]] = None) -> AsyncIterator[str]:
         """Stream the plain-chat path as server-sent events.
 
         This is an *async* generator deliberately. Starlette drains a sync
@@ -501,11 +579,15 @@ class Server:
 
             prompt_tokens = completion_tokens = 0
             finish_reason = "stop"
-            for r in mlx_lm.stream_generate(
-                self.model, self.tokenizer, prompt,
+            for r in mlx_vlm.stream_generate(
+                self.model, self.processor, prompt,
+                image=images or None,
                 max_tokens=req.max_tokens,
                 sampler=self.sampler_for(req.temperature),
                 max_kv_size=self.max_kv_size,
+                # See the note in generate(): without this, special tokens are
+                # streamed to the client as visible text.
+                skip_special_tokens=True,
             ):
                 prompt_tokens = r.prompt_tokens
                 completion_tokens = r.generation_tokens
@@ -582,8 +664,15 @@ class Server:
             # The lock is taken inside the generator, not here -- holding it
             # across the return would deadlock against the generator that
             # needs it.
-            return StreamingResponse(self.sse_chat(prompt, req),
-                                     media_type="text/event-stream")
+            return StreamingResponse(
+                self.sse_chat(prompt, req, self.images_from(req.messages)),
+                media_type="text/event-stream")
+
+        # Walked once here rather than in each path below: the same list has to
+        # reach both build_prompt (for the placeholder count) and generate (for
+        # the pixels), and the two disagreeing is the one failure mode that
+        # produces confident nonsense instead of an error.
+        images = self.images_from(req.messages)
 
         async with self.request_lock:
             # ---- Path 1: explicit schema wins over everything -----------------
@@ -592,16 +681,17 @@ class Server:
                     "schema", req.response_format["json_schema"]
                 )
                 prompt = self.build_prompt(req.messages, thinking=False)
-                text = self.generate_constrained(prompt, schema, req.max_tokens)
-                return self.envelope(content=text,
-                                     usage=self.constrained_usage(prompt, text))
+                text, usage = self.generate(prompt, req.max_tokens,
+                                            images=images, schema=schema)
+                return self.envelope(content=text, usage=usage)
 
             # ---- Path 2: tools -> native first, constrained as fallback -------
             if req.tools:
                 prompt = self.build_prompt(req.messages, tools=req.tools,
                                            thinking=req.thinking)
-                raw, usage = self.generate_free(prompt, req.max_tokens,
-                                                req.temperature)
+                raw, usage = self.generate(prompt, req.max_tokens,
+                                           images=images,
+                                           temperature=req.temperature)
 
                 if gemma4_parser is not None:
                     try:
@@ -619,19 +709,19 @@ class Server:
                 # clean one.
                 if self.looks_like_tool_attempt(raw):
                     union = self.tools_to_union_schema(req.tools)
-                    fixed = self.generate_constrained(prompt, union,
-                                                      req.max_tokens)
+                    fixed, fixed_usage = self.generate(
+                        prompt, req.max_tokens, images=images, schema=union)
                     return self.envelope(
                         tool_calls=self.to_openai_tool_calls(json.loads(fixed)),
-                        usage=self.constrained_usage(prompt, fixed),
+                        usage=fixed_usage,
                     )
 
                 return self.envelope(content=raw, usage=usage)
 
             # ---- Path 3: plain chat -------------------------------------------
             prompt = self.build_prompt(req.messages, thinking=req.thinking)
-            text, usage = self.generate_free(prompt, req.max_tokens,
-                                             req.temperature)
+            text, usage = self.generate(prompt, req.max_tokens, images=images,
+                                        temperature=req.temperature)
             return self.envelope(content=text, usage=usage)
 
     def list_models(self) -> Dict[str, Any]:
@@ -701,16 +791,23 @@ if __name__ == "__main__":
 #
 # Thinking mode vs. grammars. Gemma 4 ships configurable reasoning. Forcing a
 # strict JSON grammar over a model mid-reasoning is a known trouble spot in the
-# MLX stack -- mlx-vlm 0.6.x had exactly this failure, where a thinking budget
-# shorter than the model's natural reasoning length made constrained generation
-# either 500 or run away to max_tokens with invalid JSON. Keep thinking off on
-# the constrained path, which is what this server does. If you want reasoning
-# AND structure, do two passes: think unconstrained, then extract with a schema.
+# MLX stack, where a thinking budget shorter than the model's natural reasoning
+# length made constrained generation either 500 or run away to max_tokens with
+# invalid JSON. Keep thinking off on the constrained path, which is what this
+# server does. If you want reasoning AND structure, do two passes: think
+# unconstrained, then extract with a schema. mlx-vlm now also ships a
+# ThinkingAwareLogitsProcessor for holding the grammar open until reasoning
+# ends -- worth trying if you want both in one pass.
 #
-# Tool parser bugs. mlx-lm 0.31.2 had an open bug where the gemma4 parser threw
-# "No function provided." on valid-looking calls. 0.31.3+ is the floor here.
-# The constrained fallback above exists partly so a parser regression degrades
-# into a slow request rather than a 500.
+# Tool parser bugs. The gemma4 parser has thrown "No function provided." on
+# valid-looking calls before. The constrained fallback above exists partly so a
+# parser regression degrades into a slow request rather than a 500.
+#
+# Images. One image is ~280 tokens of KV cache and, on an M1 Air, tens of
+# seconds of prefill before the first token appears -- the vision tower runs
+# over every image in the prompt on every request, since this server keeps no
+# state between calls. A client that leaves images in its history pays that
+# on each turn: see OpenAIProvider._strip_images for the other half of this.
 #
 # Grammars constrain shape, not correctness. A schema guarantees you can call
 # .model_validate_json() without a try/except. It guarantees nothing about
@@ -722,6 +819,11 @@ if __name__ == "__main__":
 # (gemma-4-e2b-it-assistant-bf16). Worth wiring in via mlx-lm's draft model
 # support once the basics work -- but get correctness first.
 #
-# If you need image or audio input, this file will not help you: mlx-lm runs
-# Gemma 4's text path only. Switch to mlx-vlm, which has its own server with
-# response_format support, and re-read the thinking-mode note above.
+# Audio. Gemma 4 E2B has an audio tower too, and mlx_vlm.stream_generate takes
+# `audio=` alongside `image=`. Wiring it up means extending images_from() to
+# collect audio parts and passing the extra kwarg -- the same shape of change,
+# now that this file is on mlx-vlm.
+#
+# If you would rather not maintain this at all, `python -m mlx_vlm.server`
+# serves the same endpoints. What you give up is the constrained-decoding
+# fallback for tool calls in Path 2, which is this file's own idea.

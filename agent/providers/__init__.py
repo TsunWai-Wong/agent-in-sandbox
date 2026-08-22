@@ -1,4 +1,11 @@
-from .base import ChatResponse, Provider, ToolCall, ToolResult, Usage
+from .base import (
+    ChatResponse,
+    Provider,
+    ToolCall,
+    ToolResult,
+    UnsupportedFile,
+    Usage,
+)
 from .openai_provider import OpenAIProvider
 from .registry import ModelProviderRegistry, registry
 
@@ -10,6 +17,7 @@ __all__ = [
     "Provider",
     "ToolCall",
     "ToolResult",
+    "UnsupportedFile",
     "Usage",
     "registry",
 ]

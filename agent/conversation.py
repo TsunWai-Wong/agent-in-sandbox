@@ -71,9 +71,16 @@ class Conversation:
         # compacts a history that is already empty.
         self.last_usage = None
 
-    def ask(self, question: str) -> str:
+    def ask(self, question: str, files: list[str] | None = None) -> str:
+        """Ask one question, optionally with files attached.
+
+        Images only for now; an unsupported kind raises UnsupportedFile before
+        anything is sent. Attachments stay in the history verbatim and are
+        stripped to a placeholder once _manage_context() compacts the turn out
+        of the recent window — see OpenAIProvider._strip_images.
+        """
         answer, self.history, usage = self.agent.agentic_loop(
-            question, history=self.history
+            question, history=self.history, files=files
         )
         self.last_usage = usage
         if usage:

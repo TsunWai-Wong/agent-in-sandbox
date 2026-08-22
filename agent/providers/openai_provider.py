@@ -1,5 +1,9 @@
+import base64
 import json
+import mimetypes
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import openai
 from openai import OpenAI
@@ -7,21 +11,47 @@ from pydantic import BaseModel
 
 from agent.tool_registry import ToolSchema
 
-from .base import ChatResponse, ToolCall, ToolResult, Usage
+from .base import ChatResponse, ToolCall, ToolResult, UnsupportedFile, Usage
 
 
-# Point at the local MLX server in agent/providers/server.py rather than the
-# OpenAI cloud.
+# Point at the local MLX server rather than the OpenAI cloud. Either
+# agent/providers/server.py (text only) or mlx_vlm.server serves this address;
+# the latter is what multimodal input needs, since mlx-lm loads Gemma 4's text
+# tower alone:
+#     python -m mlx_vlm.server --model mlx-community/gemma-4-e2b-it-4bit \
+#         --host 127.0.0.1 --port 8080 --max-kv-size 16384
+# --host is passed explicitly because mlx_vlm.server defaults to 0.0.0.0, which
+# would publish an unauthenticated model to the local network.
 BASE_URL = "http://127.0.0.1:8080/v1"
+
+# Attachment parts carry their source filename under this key so that compact()
+# can name what it stripped. It is not part of the OpenAI schema; unknown keys
+# on a content part are passed through as JSON and ignored by both the cloud
+# API and mlx_vlm.server, which is what makes this cheaper than tracking
+# filenames in a structure parallel to the history.
+FILENAME_KEY = "x_filename"
+
+# Which suffixes count as which kind of attachment. This table and the dispatch
+# in _file_part() are the whole extension point: Gemma 4 has an audio tower and
+# mlx_vlm.server reports video support, so adding either means adding a suffix
+# set here plus one builder below -- and no signature between Conversation.ask
+# and here changes, which is the reason files= is one list rather than a
+# keyword per kind.
+IMAGE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
+)
 
 # That server never authenticates, but the SDK refuses to construct a client
 # without a key. This is a placeholder, not a secret.
 API_KEY = "not-needed"
 
-# server.py serves whichever model it was started with and ignores the `model`
-# field on the request entirely -- it is sent because the SDK requires one, and
-# named to match server.py's own default so traces read honestly.
-DEFAULT_MODEL = "mlx-community/gemma-4-E2B-it-4bit"
+# agent/providers/server.py ignores the `model` field entirely, but
+# mlx_vlm.server does not: it treats the name as a model to load, and a name
+# that differs from the loaded one evicts the weights and loads again -- about
+# 12s per request. The HF repo id is lowercase `e2b` and the Hub only redirects
+# the capitalized form, so the case here has to match what the server was
+# started with or every request pays for a reload.
+DEFAULT_MODEL = "mlx-community/gemma-4-e2b-it-4bit"
 
 # The SDK raises typed exceptions instead of surfacing HTTP status codes:
 # 429 -> RateLimitError, 5xx -> InternalServerError, and network problems or
@@ -92,8 +122,77 @@ class OpenAIProvider:
 
         return self._to_chat_response(response)
 
-    def user_message(self, text: str) -> dict:
-        return {"role": "user", "content": text}
+    def user_message(self, text: str, files: list[str] | None = None) -> dict:
+        """Build one user turn, with any attachments included.
+
+        Content stays a plain string when there are no files. Chat Completions
+        accepts either that or a list of parts, and the string form is what
+        every text-only path in this file already reads — keeping it means
+        attachments do not change the shape of an ordinary turn.
+        """
+        if not files:
+            return {"role": "user", "content": text}
+
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text},
+                *(self._file_part(file) for file in files),
+            ],
+        }
+
+    @classmethod
+    def _file_part(cls, file: str) -> dict:
+        """Build one content part for an attachment, chosen by its suffix.
+
+        Images only for now. Audio and video are what this dispatch exists to
+        grow into: the model and mlx_vlm.server both handle them, so what is
+        missing is a builder here, not a capability underneath.
+        """
+        suffix = cls._suffix_of(file)
+        if suffix in IMAGE_SUFFIXES:
+            return cls._image_part(file)
+
+        raise UnsupportedFile(
+            f"{file!r}: {suffix or 'no suffix'} is not a supported attachment. "
+            f"This provider currently sends images only "
+            f"({', '.join(sorted(IMAGE_SUFFIXES))})."
+        )
+
+    @staticmethod
+    def _suffix_of(file: str) -> str:
+        """Lowercased suffix of a path or URL.
+
+        Parsed through urlparse so a query string does not end up inside the
+        suffix — "photo.png?v=2" is still a PNG.
+        """
+        name = file if "://" not in file else urlparse(file).path
+        return Path(name).suffix.lower()
+
+    @staticmethod
+    def _image_part(image: str) -> dict:
+        """Build one image part from a local path, an http(s) URL, or a data URI.
+
+        Local files are inlined as base64 rather than passed along as paths.
+        mlx_vlm.server does accept a bare path and read the file itself, but
+        only while it shares a filesystem with this process: the same history
+        replayed against the OpenAI cloud, or against a server in the container
+        from dockerfile, would fail or read a different file. Inlining costs
+        ~33% in request size and makes the history self-contained.
+        """
+        if image.startswith(("http://", "https://", "data:")):
+            return {"type": "image_url", "image_url": {"url": image}}
+
+        path = Path(image)
+        # Falls back to PNG rather than raising: a screenshot saved without an
+        # extension is worth sending, and the server sniffs the payload anyway.
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        encoded = base64.b64encode(path.read_bytes()).decode()
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+            FILENAME_KEY: path.name,
+        }
 
     def extend(
         self,
@@ -166,21 +265,103 @@ class OpenAIProvider:
         # it. Dropping them as a set is the point: a tool message whose
         # tool_call_id no longer matches a tool_call is a 400 on the next
         # request.
+        #
+        # Images survive as a placeholder rather than being dropped with the
+        # tool traffic: "what did I show you?" is a fair question three turns
+        # later, and an answer referring to an image the history no longer
+        # mentions at all reads as a hallucination.
         kept = [
-            item
+            self._strip_images(item)
             for item in older
             if self._is_user_turn(item) or self._is_answer(item)
         ]
         return [*kept, *recent]
 
+    @classmethod
+    def _strip_images(cls, item: dict) -> dict:
+        """Replace image parts with a text placeholder naming the file.
+
+        The server is stateless, so every image in the history is re-sent and
+        re-prefilled on every subsequent request — ~280 tokens each for Gemma 4
+        E2B (config.json: vision_soft_tokens_per_image), plus its base64 in
+        this process's memory for as long as the turn survives. Past the recent
+        window the model is answering *about* the image rather than looking at
+        it again, so the name earns its place and the pixels do not.
+
+        Only the parts of a turn change, never its role or position, so
+        split_turns() finds the same boundaries on the next pass.
+        """
+        content = item.get("content")
+        # A text-only turn is already a bare string, which is the common case.
+        if not isinstance(content, list):
+            return item
+
+        parts = [
+            {"type": "text", "text": f"[image: {cls._image_name(part)}]"}
+            if cls._is_image_part(part)
+            else part
+            for part in content
+        ]
+        # Rebuilt rather than mutated: the caller still holds this dict, and
+        # compact() returning a new history while quietly editing the old one
+        # would make the two disagree.
+        return {**item, "content": parts}
+
+    @staticmethod
+    def _is_image_part(part: Any) -> bool:
+        return isinstance(part, dict) and part.get("type") == "image_url"
+
+    @staticmethod
+    def _image_name(part: dict) -> str:
+        """Name an image part for its placeholder.
+
+        Prefers the filename recorded by _image_part(). A part that came from a
+        URL keeps its basename; a data URI carries no name at all, so those
+        degrade to a generic label rather than an empty one.
+        """
+        name = part.get(FILENAME_KEY)
+        if name:
+            return name
+
+        url = (part.get("image_url") or {}).get("url", "")
+        if url.startswith("data:"):
+            return "image"
+        return Path(urlparse(url).path).name or "image"
+
     def render_transcript(self, messages: list) -> str:
         lines = []
         for item in messages:
             if self._is_user_turn(item):
-                lines.append(f"User: {item['content']}")
+                lines.append(f"User: {self._as_text(item)}")
             elif self._is_answer(item):
-                lines.append(f"Assistant: {item.get('content') or ''}")
+                lines.append(f"Assistant: {self._as_text(item)}")
         return "\n\n".join(lines)
+
+    @classmethod
+    def _as_text(cls, item: dict) -> str:
+        """Flatten one message's content to plain text.
+
+        Interpolating multimodal content straight into an f-string would hand
+        the summarizer the repr of a list of dicts — with a full base64 payload
+        inside it. That is unreadable, and at roughly 1.4x the file size in
+        characters it would blow the summarizer's own context on a single
+        screenshot.
+        """
+        content = item.get("content")
+        if content is None:
+            return ""
+        if not isinstance(content, list):
+            return str(content)
+
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if cls._is_image_part(part):
+                pieces.append(f"[image: {cls._image_name(part)}]")
+            elif part.get("type") == "text":
+                pieces.append(part.get("text", ""))
+        return " ".join(piece for piece in pieces if piece)
 
     def is_retryable(self, error: Exception) -> bool:
         return isinstance(error, RETRYABLE_ERRORS)

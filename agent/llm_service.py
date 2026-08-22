@@ -103,9 +103,9 @@ class LLMService:
 
         raise last_error
 
-    def user_message(self, text: str) -> Any:
+    def user_message(self, text: str, files: list[str] | None = None) -> Any:
         """Build one user turn in the active provider's history format."""
-        return self.provider.user_message(text)
+        return self.provider.user_message(text, files)
 
     def extend(
         self,

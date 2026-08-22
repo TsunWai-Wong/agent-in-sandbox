@@ -124,6 +124,7 @@ class Agent:
         max_turns: int = 10,
         state: RunState | None = None,
         pending: ChatResponse | None = None,
+        files: list[str] | None = None,
     ) -> tuple[str, list, Usage | None]:
         """Run the agentic loop until the model produces a final text response.
 
@@ -147,14 +148,21 @@ class Agent:
         with tracer.start_as_current_span(
             "agentic_loop", openinference_span_kind="agent"
         ) as span:
+            # The question alone, never the attachments: a base64 payload on a
+            # span attribute is megabytes of noise in the trace viewer.
             span.set_input(question or state.task)
             try:
-                return self._drive(cursor, question, max_turns, span)
+                return self._drive(cursor, question, max_turns, span, files)
             except _Halted as halted:
                 return self._finish(span, cursor, halted.reason)
 
     def _drive(
-        self, cursor: _Cursor, question: str | None, max_turns: int, span
+        self,
+        cursor: _Cursor,
+        question: str | None,
+        max_turns: int,
+        span,
+        files: list[str] | None = None,
     ) -> tuple[str, list, Usage | None]:
         """The choreography: which seam fires, and when.
 
@@ -165,7 +173,10 @@ class Agent:
         that is the property the whole design is for.
         """
         if question is not None:
-            cursor.messages.append(self.llm.user_message(question))
+            cursor.messages.append(self.llm.user_message(question, files))
+            # The gate still sees the question as text. Input guardrails match
+            # on what was written, and handing them a parts list would silently
+            # stop every one of them from matching anything.
             self._gate("on_run_start", cursor, question)
 
         tool_schemas = self.tools.get_schemas()

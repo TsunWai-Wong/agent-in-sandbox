@@ -12,6 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.tool_registry import ToolSchema
 
 
+class UnsupportedFile(ValueError):
+    """Raised for an attachment this provider cannot put on a message.
+
+    Raised while building the turn, before anything reaches the network, so an
+    unsupported file fails on the line that named it rather than as a 400 from
+    the server several frames later.
+    """
+
+
 class ToolCall(BaseModel):
     """A model's request to run one tool."""
 
@@ -109,8 +118,18 @@ class Provider(Protocol):
         """
         ...
 
-    def user_message(self, text: str) -> Any:
-        """Build one user turn in this provider's history format."""
+    def user_message(self, text: str, files: list[str] | None = None) -> Any:
+        """Build one user turn in this provider's history format.
+
+        `files` are local paths or URLs of any kind the provider supports —
+        one list rather than a keyword per kind, so that adding audio or video
+        later changes this adapter and nothing above it. Providers differ on
+        how they carry the bytes (OpenAI inlines a data URI in the message,
+        Gemini uploads to its Files API and references a URI), which is why the
+        caller passes paths and the adapter decides.
+
+        Raises UnsupportedFile for a kind this provider cannot send.
+        """
         ...
 
     def extend(
