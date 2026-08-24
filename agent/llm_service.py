@@ -1,11 +1,13 @@
 import logging
 import os
+import random
 import time
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from agent.tool_registry import ToolSchema
+from monitoring import get_tracer
 
 from .providers import (
     Attachment,
@@ -17,6 +19,7 @@ from .providers import (
 
 
 logger = logging.getLogger(__name__)
+tracer = get_tracer(__name__)
 
 DEFAULT_PROVIDER = "openai"
 MAX_ATTEMPTS = 4
@@ -75,38 +78,66 @@ class LLMService:
         object arrives on the returned response as response.parsed. Pass tools
         for agentic tool calling, and system for the instruction — never as an
         entry in messages, since providers place it differently.
+
+        The whole thing sits in one span, waiting included. Auto-instrumentation
+        already times each attempt; what it cannot show is the sleeping between
+        them, so a rate-limited call would otherwise read as an unexplained gap.
         """
-        last_error: Exception | None = None
+        with tracer.start_as_current_span(
+            "llm.chat", openinference_span_kind="chain"
+        ) as span:
+            last_error: Exception | None = None
+            waited = 0.0
 
-        for attempt in range(1, self.max_attempts + 1):
-            try:
-                return self.provider.chat(
-                    messages=messages,
-                    system=system,
-                    tools=tools,
-                    text_format=text_format,
-                    model=model or self.model,
-                )
-            except Exception as error:
-                # The provider owns its error taxonomy; anything it does not
-                # call retryable is a caller bug and propagates immediately.
-                if not self.provider.is_retryable(error):
-                    raise
-                last_error = error
-                if attempt == self.max_attempts:
-                    break
-                delay = self.backoff_seconds * 2 ** (attempt - 1)
-                logger.warning(
-                    "%s call failed (%s), attempt %d/%d, retrying in %.1fs",
-                    type(self.provider).__name__,
-                    type(error).__name__,
-                    attempt,
-                    self.max_attempts,
-                    delay,
-                )
-                time.sleep(delay)
+            for attempt in range(1, self.max_attempts + 1):
+                try:
+                    return self.provider.chat(
+                        messages=messages,
+                        system=system,
+                        tools=tools,
+                        text_format=text_format,
+                        model=model or self.model,
+                    )
+                except Exception as error:
+                    # The provider owns its error taxonomy; anything it does not
+                    # call retryable is a caller bug and propagates immediately.
+                    if not self.provider.is_retryable(error):
+                        raise
+                    last_error = error
+                    if attempt == self.max_attempts:
+                        break
+                    delay = self.backoff_seconds * 2 ** (attempt - 1)
+                    # Equal jitter: half the wait fixed, half random. Sub-agents
+                    # fan out four at a time onto one provider, and a delay that
+                    # is purely a function of the attempt number brings all four
+                    # back on the same second to take the same rate limit again.
+                    delay = delay / 2 + random.uniform(0, delay / 2)
+                    span.add_event(
+                        "retry",
+                        {
+                            "attempt": attempt,
+                            "error": type(error).__name__,
+                            "delay_s": round(delay, 3),
+                        },
+                    )
+                    logger.warning(
+                        "%s call failed (%s), attempt %d/%d, retrying in %.1fs",
+                        type(self.provider).__name__,
+                        type(error).__name__,
+                        attempt,
+                        self.max_attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    waited += delay
+                finally:
+                    # In a finally because the successful call leaves by return
+                    # and never reaches the bottom of the loop: a fast call has
+                    # to report a retry count of 0, not no count at all.
+                    span.set_attribute("retry.count", attempt - 1)
+                    span.set_attribute("retry.wait_seconds", round(waited, 3))
 
-        raise last_error
+            raise last_error
 
     @staticmethod
     def user_message(text: str, files: list[str] | None = None) -> Message:
