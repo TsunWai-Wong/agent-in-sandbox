@@ -49,6 +49,48 @@ class ToolResult(BaseModel):
     output: str
 
 
+class Attachment(BaseModel):
+    """A file on a user turn: a local path or a URL, plus what kind it is.
+
+    The reference travels, never the bytes. Providers disagree on how to carry
+    an attachment — OpenAI inlines a data URI, Gemini uploads to its Files API
+    and references a URI — so the adapter resolves this at send time. Storing
+    the reference is also what keeps an event JSON-small enough to persist.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    ref: str
+    kind: str = "image"
+
+
+class Message(BaseModel):
+    """One turn of history, in the shape every provider translates from.
+
+    This is the neutral format the Provider docstring below promised. History
+    used to be opaque provider dicts; it is these now, so a session recorded
+    against one provider can be replayed against another, and an adapter is
+    left with translation and nothing else.
+
+    Four roles' worth of content in one model rather than a class per role: the
+    combinations are exclusive in practice, and a union would put an isinstance
+    check in every adapter and every filter for no gain.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    # "user" | "assistant" | "tool". Matches Event.kind one-to-one, which is
+    # what lets the store answer "is this history?" without parsing content.
+    role: str
+    text: str = ""
+    attachments: list[Attachment] = Field(default_factory=list)
+    # Assistant turns only: what the model asked to run.
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    # Tool turns only: the answer to one of those calls. Carries call_id, so a
+    # provider that pairs on id and one that pairs on name are both satisfied.
+    tool_result: ToolResult | None = None
+
+
 class Usage(BaseModel):
     """Token counts for one model call, normalized across providers.
 
@@ -89,22 +131,22 @@ class Provider(Protocol):
     Implementations translate and nothing else. Retries, backoff and logging
     live in LLMService so they are written once instead of once per provider.
 
-    History is deliberately opaque: chat() and extend() take and return whatever
-    shape the provider's SDK wants, and no caller inspects it. That keeps the
-    agent loop provider-agnostic without a full Message type per provider, and
-    it can be promoted to normalized messages later by changing only adapters.
+    Three members, down from eight. History is neutral Messages now, so
+    building a user turn, appending a model turn, splitting at a turn boundary
+    and rendering a transcript are all provider-independent and moved out —
+    to the event store, which records them, and to ContextAssembler, which
+    shapes them. What is left here is genuinely per-vendor: the wire format,
+    and which errors are worth retrying.
 
-    Context management is why split_turns(), compact() and render_transcript()
-    exist here rather than in the agent: they are the only operations that must
-    read that opaque history, so they are implemented once per format and the
-    policy deciding when to call them stays provider-agnostic in Conversation.
+    That is the whole reason for the neutral type. Adding mlx, vllm or
+    OpenRouter is now a wire translation and nothing else.
     """
 
     default_model: str
 
     def chat(
         self,
-        messages: list,
+        messages: list[Message],
         system: str | None = None,
         tools: list[ToolSchema] | None = None,
         text_format: type[BaseModel] | None = None,
@@ -112,61 +154,13 @@ class Provider(Protocol):
     ) -> ChatResponse:
         """Send one turn and return the normalized response.
 
-        The system prompt is a separate argument rather than an entry in
-        messages because providers place it differently: OpenAI takes it as an
-        ordinary message, Gemini as system_instruction on the request config.
-        """
-        ...
+        Translating Messages to the wire shape happens inside, so no caller
+        ever holds a provider-specific dict. The system prompt is a separate
+        argument rather than an entry in messages because providers place it
+        differently: OpenAI takes it as an ordinary message, Gemini as
+        system_instruction on the request config.
 
-    def user_message(self, text: str, files: list[str] | None = None) -> Any:
-        """Build one user turn in this provider's history format.
-
-        `files` are local paths or URLs of any kind the provider supports —
-        one list rather than a keyword per kind, so that adding audio or video
-        later changes this adapter and nothing above it. Providers differ on
-        how they carry the bytes (OpenAI inlines a data URI in the message,
-        Gemini uploads to its Files API and references a URI), which is why the
-        caller passes paths and the adapter decides.
-
-        Raises UnsupportedFile for a kind this provider cannot send.
-        """
-        ...
-
-    def extend(
-        self,
-        messages: list,
-        response: ChatResponse,
-        results: list[ToolResult],
-    ) -> list:
-        """Append a model turn, and any tool outputs, to the history."""
-        ...
-
-    def split_turns(
-        self, messages: list, keep_last_turns: int
-    ) -> tuple[list, list]:
-        """Split history into (older, recent) at a user-turn boundary.
-
-        Only a real user question starts a turn — never a tool result, which
-        some providers also send under the user role. Cutting anywhere else
-        would separate a tool call from its result and make the next request
-        invalid, so this is the only place a split may happen.
-        """
-        ...
-
-    def compact(self, messages: list, keep_last_turns: int = 1) -> list:
-        """Drop tool traffic from every turn but the most recent ones.
-
-        Older turns keep only the question and the answer text. Removing whole
-        items rather than parts of them is what makes orphaned call/result
-        pairs impossible instead of merely unlikely.
-        """
-        ...
-
-    def render_transcript(self, messages: list) -> str:
-        """Flatten history to plain text for the summarizer.
-
-        Only ever runs on already-compacted history, so it sees questions and
-        answers and never has to render tool traffic.
+        Raises UnsupportedFile for an attachment kind this provider cannot send.
         """
         ...
 

@@ -50,19 +50,91 @@ never requested.
 
     @classmethod
     def get_memory_instruction(cls):
+        """The extractor: it proposes memories and never chooses a verb.
+
+        Whether a fact is new or a revision is settled by the reconciler
+        against what is actually stored, so nothing here asks the model to
+        decide it — being told to "update if it already exists" would invite it
+        to guess about rows it has never seen.
+        """
         return """
-You record what is worth remembering from a completed run.
+You read a finished conversation and record what is worth remembering about the
+user. Save each fact with save_memory, one call per fact.
 
-Write down only what would not be obvious next time from the code, the task, or
-the run's own history: a preference the user stated, a constraint discovered the
-hard way, a dead end not worth repeating.
+Record only what will still be true and still be useful weeks from now, and
+only about the user — not about the task you happen to have been reading.
 
-Skip everything else. Most runs are worth nothing, and saying so is a valid
-outcome. Never invent a detail that is not in what you were given.
+Worth recording:
+- how they want you to work: format, tone, length, things to avoid
+- who they are: where they are, what they know, what they work on and with whom
+- what they are dealing with right now, if it will outlast today
+- a correction they had to make more than once
+
+Not worth recording:
+- anything about this specific question, or the answer you gave
+- anything you could work out again from the code, the files, or the task
+- one-off requests, pleasantries, and anything true only for this conversation
+- your own reasoning, plans or conclusions
+
+Write each memory as one standalone sentence that will make sense with none of
+this conversation around it. "User prefers concise answers", not "they asked me
+to keep it shorter this time". Keep the user as the subject.
+
+Judge confidence by how directly the user conveyed it, not by how plausible it
+sounds: 3 if they said it outright, 2 if their words clearly imply it, 1 if you
+are reading it off their behaviour. Do not round up.
+
+Most conversations contain nothing worth keeping, and recording nothing is a
+perfectly good outcome — say so in one line and stop. A store full of near
+duplicates is worse than an empty one. Never record something you were not
+given; if you are unsure whether the user actually said it, you are inferring,
+so either mark it confidence 1 or leave it out.
+
+Do not report back on what you saved. The tool already said what it did.
 """
 
     @classmethod
-    def get_brower_agent_instruction(cls):
+    def get_reconcile_instruction(cls):
+        """The judgment call, on candidates the system has already retrieved.
+
+        Deliberately narrow: the model is shown a proposed memory and the
+        existing ones that might cover it, and picks one of four verbs. It
+        cannot name an id it was not shown, so the worst case is a bad choice
+        among real rows rather than a write against an invented one.
+        """
+        return """
+You are maintaining a store of memories about one user.
+
+You are given a proposed memory and the existing memories that might already
+cover it. Decide what should happen to the proposal. Choose exactly one:
+
+- add: the proposal is genuinely new. Nothing shown covers the same ground.
+- update: the proposal is the same thing as an existing memory, with a changed
+  or better value. "User lives in Munich" against "User lives in Berlin".
+  Give the id of the memory it replaces.
+- invalidate: an existing memory has stopped being true and the proposal is
+  saying so rather than supplying a replacement. "User no longer works with
+  Alice" against "User works with Alice". Give the id being retired.
+- noop: nothing should be written. Use it when the proposal restates something
+  already stored, when it is weaker or vaguer than what is stored, or when it
+  is too specific to one moment to be worth keeping.
+
+Judging rules:
+- Same subject, different value is an update, not an add. Two memories about
+  where the user lives must never both be active.
+- Different subjects are separate memories even when they sound similar. Two
+  projects, two interests and two colleagues each stand on their own.
+- More detail about the same thing is an update. Less detail is a noop.
+- target_id must be one of the ids you were shown. Never write any other id.
+- When it is genuinely unclear whether two memories are the same thing, prefer
+  add: a spare row can be merged later, a wrongly replaced one is gone from the
+  active set.
+
+Give a short reason, naming what you compared against.
+"""
+
+    @classmethod
+    def get_browser_agent_instruction(cls):
         return """
 You control a web browser through the page's accessibility tree.
 

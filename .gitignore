@@ -19,3 +19,6 @@ bench_logs/
 
 # scheduler run bookkeeping (SQLite, plus its WAL sidecars)
 scheduler.db*
+
+# downloaded ONNX embedding model (~1.2GB), fetched rather than committed
+memory/models/

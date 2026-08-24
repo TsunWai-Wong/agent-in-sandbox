@@ -1,6 +1,7 @@
 import logging
 
 from .base import Provider
+from .gemini_provider import GeminiProvider
 from .openai_provider import OpenAIProvider
 
 
@@ -38,3 +39,4 @@ class ModelProviderRegistry:
 
 registry = ModelProviderRegistry()
 registry.register("openai", OpenAIProvider)
+registry.register("gemini", GeminiProvider)

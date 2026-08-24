@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .ledger import RunState
+from .event_store import RunState
 
 
 # ---------------------------------------------------------------------------

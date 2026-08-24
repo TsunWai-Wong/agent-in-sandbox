@@ -1,14 +1,19 @@
 import logging
 import os
 import time
-from typing import Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from agent.tool_registry import ToolSchema
 
-from .providers import ChatResponse, Provider, ToolResult, registry
+from .providers import (
+    Attachment,
+    ChatResponse,
+    Message,
+    Provider,
+    registry,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +63,7 @@ class LLMService:
 
     def chat(
         self,
-        messages: list,
+        messages: list[Message],
         system: str | None = None,
         tools: list[ToolSchema] | None = None,
         text_format: type[BaseModel] | None = None,
@@ -103,29 +108,17 @@ class LLMService:
 
         raise last_error
 
-    def user_message(self, text: str, files: list[str] | None = None) -> Any:
-        """Build one user turn in the active provider's history format."""
-        return self.provider.user_message(text, files)
+    @staticmethod
+    def user_message(text: str, files: list[str] | None = None) -> Message:
+        """Build one user turn.
 
-    def extend(
-        self,
-        messages: list,
-        response: ChatResponse,
-        results: list[ToolResult],
-    ) -> list:
-        """Append a model turn, and any tool outputs, to the history."""
-        return self.provider.extend(messages, response, results)
-
-    def split_turns(
-        self, messages: list, keep_last_turns: int
-    ) -> tuple[list, list]:
-        """Split history into (older, recent) at a user-turn boundary."""
-        return self.provider.split_turns(messages, keep_last_turns)
-
-    def compact(self, messages: list, keep_last_turns: int = 1) -> list:
-        """Drop tool traffic from every turn but the most recent ones."""
-        return self.provider.compact(messages, keep_last_turns)
-
-    def render_transcript(self, messages: list) -> str:
-        """Flatten history to plain text for the summarizer."""
-        return self.provider.render_transcript(messages)
+        No longer a forward to the provider: a Message is neutral, so this is
+        construction rather than translation. Kept here because every caller
+        already had it, and because attachments are named by reference — the
+        adapter is what decides how to carry the bytes.
+        """
+        return Message(
+            role="user",
+            text=text,
+            attachments=[Attachment(ref=file) for file in (files or [])],
+        )

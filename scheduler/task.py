@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from agent.agent import Agent
-from agent.conversation import DEFAULT_TOKEN_BUDGET
+from agent.context_budget import DEFAULT_TOKEN_BUDGET
 
 from .delivery import Channel
 from .outcome import OutcomeSink

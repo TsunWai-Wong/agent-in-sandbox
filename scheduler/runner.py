@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Callable
 
-from agent.conversation import Conversation
+from agent.session import Session
 
 from .outcome import Outcome, OutcomeSink
 from .store import SqliteStore
@@ -64,9 +64,9 @@ def _execute(task: ScheduledTask) -> Outcome:
         # A conversation with no history, used for exactly one question and then
         # dropped. That is the whole of session isolation here — Agent holds
         # nothing per-session, so there is nothing else to reset.
-        conversation = Conversation(agent, token_budget=task.token_budget)
+        session = Session.begin(user_id=task.user_id if hasattr(task, "user_id") else None)
         _with_deadline(
-            lambda: conversation.ask(task.prompt), task.deadline_seconds
+            lambda: agent.ask(session, task.prompt), task.deadline_seconds
         )
     except Exception as error:
         # A monitor that dies quietly is worse than no monitor, so the failure

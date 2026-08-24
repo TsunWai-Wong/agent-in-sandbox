@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from monitoring import get_tracer
 
-from .ledger import RunState
+from .event_store import RunState
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: Agent imports middleware
     from .agent import Agent
@@ -209,7 +209,7 @@ class SubAgentRegistry:
                     span.set_input(task.render())
                     try:
                         agent = spec.build()
-                        text, _, _ = agent.agentic_loop(
+                        text, _ = agent.agentic_loop(
                             task.render(), max_turns=spec.max_turns, state=child
                         )
                         span.set_output(text or "")
@@ -218,7 +218,9 @@ class SubAgentRegistry:
                             "subagent_returned",
                             key=name,
                             of=dispatched.seq,
-                            run_id=child.run_id,
+                            # Not run_id=: that is an Event field now, and the
+                            # event belongs to the parent's run either way.
+                            child_run_id=child.run_id,
                             tokens=child.total_tokens,
                         )
                         return SubResult(
@@ -238,7 +240,7 @@ class SubAgentRegistry:
                             "subagent_failed",
                             key=name,
                             of=dispatched.seq,
-                            run_id=child.run_id,
+                            child_run_id=child.run_id,
                             tokens=child.total_tokens,
                             error=str(error),
                         )
