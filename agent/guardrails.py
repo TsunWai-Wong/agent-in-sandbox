@@ -3,8 +3,8 @@
 Ordered by what they cost, because that is the order the registry runs them in:
 
     cost 0   deterministic, free       TieredApproval, ToolResultSanitizer
-    cost 0   free, reads the ledger    AttemptBudget, HumanApproval
-    cost 2   an API call, or a run     ReviewGate, MemoryWriter
+    cost 0   free, reads the log       AttemptBudget, HumanApproval
+    cost 2   an API call, or a run     ReviewGate, ContextBudget
 
 Never pay a model to judge something a regex already rejected — which is also
 why the highest-value guardrail here is a free one, not the reviewer.
@@ -22,7 +22,6 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from .event_store import RunState
 from .middleware import (
@@ -35,11 +34,6 @@ from .middleware import (
     Stop,
 )
 from .subagents import Mode, SubAgentRegistry, SubTask
-
-if TYPE_CHECKING:
-    # Type-only, so the dependency stays one-way: memory/ is built on agent/,
-    # and agent/ must not need memory/ to import.
-    from memory.session import MemorySession
 
 logger = logging.getLogger(__name__)
 
@@ -333,40 +327,3 @@ class ReviewGate(Middleware):
             f"A review of your answer found problems:\n\n{verdict}\n\n"
             f"Address them, then give your answer again."
         )
-
-
-class MemoryWriter(Middleware):
-    """Hands a finished run to the memory session, without anyone waiting.
-
-    Fires at on_run_end and not on_model_stop: the latter also fires on the
-    passes where a reviewer sends the answer back, and half-finished runs are
-    not what you want to remember.
-
-    What it does NOT do is write on every run. A ten-turn conversation would
-    pay for ten extractions over overlapping material, nine of which see a
-    single question with no idea what came before it. So the middleware
-    asks the session whether a flush is due; when a Session spans many runs the
-    answer is usually no, and the real trigger is session close. `per_run` is
-    for the other caller — a one-shot ask() where the run is the whole session.
-
-    Holds no run state of its own, and neither does the session any more: the
-    turns are on the event store, and what is unwritten is a watermark on it.
-    """
-
-    def __init__(self, session: "MemorySession", per_run: bool = True):
-        self.session = session
-        self.per_run = per_run
-
-    def on_run_end(self, state: RunState, answer: str) -> Decision:
-        if not self.session.enabled:
-            # Recorded rather than skipped quietly: a disabled writer and a
-            # broken one are indistinguishable from the outside, and "why did
-            # it forget?" is the question you actually have later.
-            self.session.skip(state, "recording disabled")
-            return CONTINUE
-
-        if self.per_run:
-            self.session.flush(state, reason="run_end")
-        elif self.session.is_due(state):
-            self.session.flush(state, reason="turn_backstop")
-        return CONTINUE

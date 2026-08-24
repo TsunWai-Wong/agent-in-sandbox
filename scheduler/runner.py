@@ -66,7 +66,7 @@ def _execute(task: ScheduledTask) -> Outcome:
         # nothing per-session, so there is nothing else to reset.
         session = Session.begin(user_id=task.user_id if hasattr(task, "user_id") else None)
         _with_deadline(
-            lambda: agent.ask(session, task.prompt), task.deadline_seconds
+            lambda: agent.run_loop(task.prompt, session=session), task.deadline_seconds
         )
     except Exception as error:
         # A monitor that dies quietly is worse than no monitor, so the failure

@@ -209,8 +209,8 @@ class SubAgentRegistry:
                     span.set_input(task.render())
                     try:
                         agent = spec.build()
-                        text, _ = agent.agentic_loop(
-                            task.render(), max_turns=spec.max_turns, state=child
+                        text = agent.run_loop(
+                            task.render(), state=child, max_turns=spec.max_turns
                         )
                         span.set_output(text or "")
                         state.append(

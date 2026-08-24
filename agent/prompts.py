@@ -49,17 +49,21 @@ never requested.
 """
 
     @classmethod
-    def get_memory_instruction(cls):
+    def get_extract_instruction(cls):
         """The extractor: it proposes memories and never chooses a verb.
 
         Whether a fact is new or a revision is settled by the reconciler
         against what is actually stored, so nothing here asks the model to
         decide it — being told to "update if it already exists" would invite it
         to guess about rows it has never seen.
+
+        Structured output rather than tool calls: one call returns every draft
+        at once, which is what lets the writer be a middleware instead of a
+        sub-agent with a tool registry and a loop of its own.
         """
         return """
-You read a finished conversation and record what is worth remembering about the
-user. Save each fact with save_memory, one call per fact.
+You read a finished conversation and return what is worth remembering about the
+user, as a list of memories. Return an empty list when there is nothing.
 
 Record only what will still be true and still be useful weeks from now, and
 only about the user — not about the task you happen to have been reading.
@@ -71,7 +75,7 @@ Worth recording:
 - a correction they had to make more than once
 
 Not worth recording:
-- anything about this specific question, or the answer you gave
+- anything about this specific question, or the answer that was given
 - anything you could work out again from the code, the files, or the task
 - one-off requests, pleasantries, and anything true only for this conversation
 - your own reasoning, plans or conclusions
@@ -80,17 +84,17 @@ Write each memory as one standalone sentence that will make sense with none of
 this conversation around it. "User prefers concise answers", not "they asked me
 to keep it shorter this time". Keep the user as the subject.
 
+Pick memory_type from: directive (how they want you to respond), profile (who
+they are), current (what they are dealing with now), event (something dated).
+
 Judge confidence by how directly the user conveyed it, not by how plausible it
 sounds: 3 if they said it outright, 2 if their words clearly imply it, 1 if you
 are reading it off their behaviour. Do not round up.
 
-Most conversations contain nothing worth keeping, and recording nothing is a
-perfectly good outcome — say so in one line and stop. A store full of near
-duplicates is worse than an empty one. Never record something you were not
-given; if you are unsure whether the user actually said it, you are inferring,
-so either mark it confidence 1 or leave it out.
-
-Do not report back on what you saved. The tool already said what it did.
+Most conversations contain nothing worth keeping, and an empty list is a
+perfectly good answer. A store full of near duplicates is worse than an empty
+one. Never record something you were not given; if you are unsure whether the
+user actually said it, you are inferring, so mark it 1 or leave it out.
 """
 
     @classmethod

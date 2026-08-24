@@ -1,6 +1,5 @@
 import json
-from collections.abc import Callable
-from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING
 
 from openinference.semconv.trace import SpanAttributes
@@ -19,16 +18,21 @@ from .middleware import (
     Replace,
     Stop,
 )
-from .providers import ChatResponse, Message, ToolResult, Usage
+from .providers import ChatResponse, Message, ToolResult
 from .skills import SkillRegistry
 from .tool_registry import ToolRegistry
 
 if TYPE_CHECKING:
-    # Type-only: Session imports nothing from here, and the agent must not
-    # need a session to be constructed.
+    # Type-only, and for UserMemoryStore that matters: memory/ imports agent/ at
+    # runtime, so a real import here would put a cycle one careless line away.
+    # The .search() call below is duck-typed.
+    from memory.memory_store import UserMemoryStore
+
     from .session import Session
 
+logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
+
 
 class AgentLoopError(Exception):
     pass
@@ -37,31 +41,27 @@ class AgentLoopError(Exception):
 class RunPaused(Exception):
     """A middleware asked for a human before the run may go on.
 
-    Carries everything needed to pick the run up again — possibly in another
-    process, possibly hours later — because that is the whole reason the ledger
-    is a passive record rather than a set of live callbacks. Nothing is blocked
-    and no thread is held while the answer is outstanding.
+    Carries everything needed to resume — possibly in another process, hours
+    later — which is the whole reason middleware return decisions instead of
+    calling back. No thread is held while the answer is outstanding.
     """
 
-    def __init__(self, state: RunState, pending, decision: Pause):
+    def __init__(self, state: RunState, pending: ChatResponse | None, decision: Pause):
         super().__init__(decision.question)
-        # The state carries the event store, so the history rides along with it
-        # — there is nothing left for the caller to hold on to separately.
+        # The state carries the event store, so the history rides along with it.
         self.state = state
         # The model turn whose tools have not run yet, or None when the pause
-        # happened somewhere no tools were waiting.
+        # happened where nothing was waiting.
         self.pending = pending
         self.question = decision.question
         self.key = decision.key
 
 
 class _Halted(Exception):
-    """Internal: a Stop decision, travelling the same way a Pause does.
+    """Internal: a Stop decision, travelling the way a Pause does.
 
-    Stop and Pause are the only two verbs that mean "this run does not carry
-    on". Having one return a value while the other raised forced every seam to
-    handle both by hand; making them symmetric is what lets a seam be one line.
-    Never escapes agentic_loop — it is caught and turned into an ordinary return.
+    Stop and Pause both mean "this run does not carry on". Making them
+    symmetric is what lets a seam be one line. Never escapes run_loop.
     """
 
     def __init__(self, reason: str):
@@ -69,41 +69,7 @@ class _Halted(Exception):
         self.reason = reason
 
 
-@dataclass
-class _Cursor:
-    """Everything one run mutates as it goes.
-
-    Bundled so the helpers below can take a single argument instead of five,
-    and so the token bookkeeping lives next to the history it describes rather
-    than as four parallel locals that have to be threaded through by hand.
-    """
-
-    state: RunState
-    # No messages here any more: the history is the event store, and rebuilding
-    # it per call is what lets a summarization appended mid-run take effect on
-    # the very next request.
-    # A model turn whose tools have not run yet, set only when resuming.
-    pending: ChatResponse | None = None
-    last_usage: Usage | None = None
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-
-    def record(self, usage: Usage | None) -> None:
-        if not usage:
-            return
-        self.last_usage = usage
-        self.prompt_tokens += usage.input_tokens
-        self.completion_tokens += usage.output_tokens
-
-
 class Agent:
-    tools: ToolRegistry
-    llm: LLMService
-    context: ContextAssembler
-    skills: SkillRegistry | None
-    middleware: MiddlewareRegistry
-
-
     def __init__(
         self,
         tools: ToolRegistry,
@@ -111,195 +77,218 @@ class Agent:
         instruction: str,
         skills: SkillRegistry | None = None,
         middleware: MiddlewareRegistry | None = None,
-        memories: Callable[[], str] | None = None,
+        memories: "UserMemoryStore | None" = None,
+        user_id: str = "",
     ):
         self.tools = tools
         self.llm = llm
-        # The instruction describes the agent, not any one conversation, so it
-        # sits alongside the tools and the model. Being immutable is what lets
-        # an agent be built once and shared while histories stay per session.
-        # The assembler owns it now: what the model reads is the instruction
-        # plus whatever sections apply to this request.
+        # The instruction describes the agent, not a conversation, which is what
+        # lets one agent be shared while histories stay per session.
         self.context = ContextAssembler(instruction)
-        # Optional, so the eval scripts and any caller with no skills directory
-        # keep working unchanged — the menu section simply never appears.
         self.skills = skills
-        # Also optional: an empty registry consults nobody, so an agent built
-        # the old way behaves exactly as it did before the seams existed.
         self.middleware = middleware or MiddlewareRegistry()
-        # A callable rather than a store, for the same reason skills is a
-        # registry: the agent needs the rendered block at call time and has no
-        # business knowing where it came from. Leaving it None is the recall
-        # half of the memory switch — nothing is fetched and no section appears.
         self.memories = memories
+        # Whose memories. Not on RunState — a run does not own a user, a session
+        # does. Empty disables recall as surely as memories=None.
+        self.user_id = user_id
 
-    def agentic_loop(
+    # -- entry points ---------------------------------------------------------
+
+    def run_loop(
         self,
         question: str | None = None,
-        max_turns: int = 10,
+        *,
+        session: "Session | None" = None,
         state: RunState | None = None,
-        pending: ChatResponse | None = None,
+        max_turns: int = 10,
         files: list[str] | None = None,
-    ) -> tuple[str, Usage | None]:
-        """Run the agentic loop until the model produces a final text response.
+        pending: ChatResponse | None = None,
+    ) -> str:
+        """Run until the model produces a final text response.
 
-        Returns the answer and the usage of the final call. No history: it is
-        recorded on the state's event store as it happens, so the caller who
-        owns the session already has it and cannot be handed a stale copy.
+        Three ways to say which run this is, in precedence order:
 
-        The usage returned is the last call's, not the turn's total, because
-        its input_tokens is the size of everything the model was asked to read
-        — which is the quantity a caller managing context needs to act on. The
-        turn's total is a different question and lives on the ledger, where a
-        sub-agent's spend can be rolled into it.
+            state     an existing run — resuming, or a sub-agent's own
+            session   a new run in this conversation
+            neither   an ephemeral run, owned by nobody
 
-        Raises RunPaused when a middleware wants a human. Pass the exception
-        back to resume() once the answer is in.
+        Returns the answer alone. Everything else a caller might want — the
+        history, the token spend — is on the state's event store, where it
+        cannot be handed over stale.
+
+        Raises RunPaused when a middleware wants a human; pass it to resume().
         """
-        state = state or RunState.begin(task=question or "")
-        cursor = _Cursor(state=state, pending=pending)
-
+        state = state or (
+            session.begin_run(question or "")
+            if session
+            else RunState.begin(question or "")
+        )
         with tracer.start_as_current_span(
-            "agentic_loop", openinference_span_kind="agent"
+            "run_loop", openinference_span_kind="agent"
         ) as span:
             # The question alone, never the attachments: a base64 payload on a
             # span attribute is megabytes of noise in the trace viewer.
             span.set_input(question or state.task)
             try:
-                return self._drive(cursor, question, max_turns, span, files)
+                return self._drive(state, question, max_turns, span, files, pending)
             except _Halted as halted:
-                return self._finish(span, cursor, halted.reason)
+                return self._finish(span, state, halted.reason)
+
+    def resume(
+        self, paused: RunPaused, approved: bool, note: str = "", max_turns: int = 10
+    ) -> str:
+        """Answer a Pause and carry on.
+
+        The answer is stamped against the key the pause carried, so it applies
+        to that exact tool call and not to the next one sharing a name.
+        Middleware re-run on the way through and find the stamp waiting.
+        """
+        state = paused.state
+        state.append(
+            "on_resume",
+            "human_approved" if approved else "human_denied",
+            key=paused.key,
+            note=note,
+        )
+        self.middleware.consult(
+            "on_resume", state, HumanDecision(approved, paused.key, note)
+        )
+        return self.run_loop(
+            None, state=state, max_turns=max_turns, pending=paused.pending
+        )
+
+    # -- the loop -------------------------------------------------------------
 
     def _drive(
         self,
-        cursor: _Cursor,
+        state: RunState,
         question: str | None,
         max_turns: int,
         span,
-        files: list[str] | None = None,
-    ) -> tuple[str, Usage | None]:
+        files: list[str] | None,
+        pending: ChatResponse | None,
+    ) -> str:
         """The choreography: which seam fires, and when.
 
-        Deliberately the only place that names a seam, and deliberately short.
-        The mechanics of applying a decision, calling the model and running a
-        tool batch live in the helpers below — but which checkpoints exist and
-        what order they come in stays readable straight down this method, since
-        that is the property the whole design is for.
+        Deliberately the only place that names a seam. The mechanics live in the
+        helpers below so that which checkpoints exist, and in what order, stays
+        readable straight down this method.
         """
         if question is not None:
-            cursor.state.record_message(
-                USER_MESSAGE, self.llm.user_message(question, files)
-            )
-            # The gate still sees the question as text. Input guardrails match
-            # on what was written, and handing them a parts list would silently
-            # stop every one of them from matching anything.
-            self._gate("on_run_start", cursor, question)
+            state.record_message(USER_MESSAGE, self.llm.user_message(question, files))
+            # Gates see the question as text. Input guardrails match on what was
+            # written, and a parts list would silently stop every one of them.
+            self._gate("on_run_start", state, question)
 
         tool_schemas = self.tools.get_schemas()
 
         for _ in range(max_turns):
-            if cursor.pending is not None:
-                # Resuming into a model turn whose tools never ran. Nothing to
-                # re-ask — the response is already in hand.
-                response, cursor.pending = cursor.pending, None
+            if pending is not None:
+                # Resuming into a model turn whose tools never ran.
+                response, pending = pending, None
             else:
-                self._gate("before_model", cursor)
-                response = self._call_model(cursor, tool_schemas, span)
+                self._gate("before_model", state)
+                response = self._call_model(state, tool_schemas, span)
 
             if response.tool_calls:
-                self._run_tools(cursor, response)
+                self._run_tools(state, response)
                 continue
 
-            # Record the final turn too, or the next question in the
-            # conversation would not see the answer it follows from.
             answer = response.text or ""
-            cursor.state.record_message(
-                AGENT_MESSAGE, Message(role="assistant", text=answer)
-            )
+            state.record_message(AGENT_MESSAGE, Message(role="assistant", text=answer))
 
-            if self._gate("on_model_stop", cursor, answer):
+            if self._gate("on_model_stop", state, answer):
                 # A gate sent the answer back. The model reads the correction as
-                # an ordinary user turn, having no idea a reviewer exists.
+                # an ordinary user turn, with no idea a reviewer exists.
                 continue
 
-            return self._finish(span, cursor, answer)
+            return self._finish(span, state, answer)
 
         raise AgentLoopError(f"Agent did not complete within {max_turns} turns")
 
-    # -- the mechanics ---------------------------------------------------------
-
-    def _gate(self, seam: str, cursor: _Cursor, *args) -> bool:
+    def _gate(self, seam: str, state: RunState, *args) -> bool:
         """Fire one whole-run seam and act on the answer.
 
-        Two categories, and that is what collapses this to a single call site
-        line. Continue and Inject are in-band: the loop carries on, with any
-        injected text added to what the model reads next. Stop and Pause are
-        out-of-band: the run is over or suspended, so both leave by exception
-        rather than as a value a caller could forget to check.
-
-        Returns whether something was injected, which is the only thing a caller
-        still has a choice about.
+        Continue and Inject are in-band. Stop and Pause are out-of-band, so both
+        leave by exception rather than as a value a caller could forget to check.
+        Returns whether something was injected.
         """
-        decision = self.middleware.consult(seam, cursor.state, *args)
+        decision = self.middleware.consult(seam, state, *args)
         if isinstance(decision, (Stop, Deny)):
             raise _Halted(str(decision))
         if isinstance(decision, Pause):
-            raise RunPaused(cursor.state, cursor.pending, decision)
+            # No pending here: every gate fires where a model turn is either
+            # already consumed or never started.
+            raise RunPaused(state, None, decision)
         if isinstance(decision, Inject):
-            cursor.state.record_message(
+            state.record_message(
                 USER_MESSAGE, self.llm.user_message(decision.message)
             )
             return True
         return False
 
-    def _call_model(self, cursor: _Cursor, tool_schemas: list, span) -> ChatResponse:
-        """One model call, with the instruction rebuilt and the cost recorded."""
+    def _call_model(self, state: RunState, tool_schemas: list, span) -> ChatResponse:
+        """One model call, with the request rebuilt and the cost recorded."""
         # Reassembled every call, not once before the loop: this is what makes
-        # load_skill take effect. The call lands mid-turn, and the doc it
-        # activated has to be in the instruction on the very next request rather
-        # than after the answer is already written.
+        # load_skill take effect on the very next request rather than after the
+        # answer is already written. Same for the history, which a mid-run
+        # compaction may have just shortened.
         response = self.llm.chat(
-            messages=self.context.build_messages(cursor.state.event_store),
+            messages=self.context.build_messages(state.event_store),
             system=self.context.build_system_prompt(
                 skills=self.skills.get_menu() if self.skills else None,
                 skill_docs=self.skills.get_active_docs() if self.skills else None,
-                memories=self.memories() if self.memories else None,
+                memories=self._about_user(state.task),
             ),
             tools=tool_schemas,
         )
-        cursor.record(response.usage)
-        # Rewritten every iteration rather than once at the end, so the rollup is
-        # on the span whichever way the loop exits.
-        self._record_tokens(span, cursor.prompt_tokens, cursor.completion_tokens)
-        # One line per model call, so attempts and token spend are derived from
-        # the ledger instead of counted by middleware.
-        # input_tokens separately from the total, because it is the size of what
-        # the model was asked to read — the quantity ContextBudget acts on.
-        cursor.state.append(
+        usage = response.usage
+        # One line per call, so attempts and spend are derived from the log
+        # rather than counted. input_tokens separately, because it is the size of
+        # what the model was asked to read — the quantity ContextBudget acts on.
+        state.append(
             "before_model",
             "model_call",
-            tokens=(response.usage.total_tokens if response.usage else 0),
-            input_tokens=(response.usage.input_tokens if response.usage else 0),
-            output_tokens=(response.usage.output_tokens if response.usage else 0),
+            tokens=usage.total_tokens if usage else 0,
+            input_tokens=usage.input_tokens if usage else 0,
+            output_tokens=usage.output_tokens if usage else 0,
         )
+        self._record_tokens(span, state)
         return response
 
-    def _run_tools(self, cursor: _Cursor, response: ChatResponse) -> None:
+    def _about_user(self, question: str) -> str | None:
+        """The recall block, or None when there is nothing to say.
+
+        Retrieval is an upgrade to an answer, never a precondition for one, and
+        this runs inside every model call — so an unguarded query would turn a
+        database hiccup into a failed reply.
+        """
+        if not (self.memories and self.user_id):
+            return None
+        try:
+            rows = self.memories.search(self.user_id, question, with_directives=True)
+        except Exception:
+            logger.exception("memory unavailable; answering without it")
+            return None
+        return "\n".join(f"- {row['content']}" for row in rows) or None
+
+    # -- tools ----------------------------------------------------------------
+
+    def _run_tools(self, state: RunState, response: ChatResponse) -> None:
         """Consult on a whole batch of tool calls, then run it.
 
-        Every call is consulted before any of it runs. A pause halfway would
-        leave the history holding tool calls with no results, which every
-        provider rejects on the next request — so the batch is all-or-nothing,
-        and a resume replays it from the top.
+        Every call is consulted before any of it runs: a pause halfway would
+        leave calls with no results, which every provider rejects on the next
+        request. So the batch is all-or-nothing and a resume replays it whole.
 
-        before_tool cannot use _gate: Deny and Replace are answers about one
-        call, not about the run, so they are collected rather than raised.
+        before_tool cannot use _gate — Deny and Replace answer about one call,
+        not the run, so they are collected rather than raised.
         """
         decisions = []
         for call in response.tool_calls:
-            decision = self.middleware.consult("before_tool", cursor.state, call)
+            decision = self.middleware.consult("before_tool", state, call)
             if isinstance(decision, Pause):
-                raise RunPaused(cursor.state, response, decision)
+                raise RunPaused(state, response, decision)
             if isinstance(decision, Stop):
                 raise _Halted(str(decision))
             decisions.append(decision)
@@ -307,21 +296,23 @@ class Agent:
         # The assistant turn carrying the calls goes down first, then one event
         # per result: a provider pairs them by call_id, and the store preserves
         # the order they were written in.
-        cursor.state.record_message(
+        state.record_message(
             AGENT_MESSAGE,
             Message(
-                role="assistant", text=response.text or "", tool_calls=response.tool_calls
+                role="assistant",
+                text=response.text or "",
+                tool_calls=response.tool_calls,
             ),
         )
         for call, decision in zip(response.tool_calls, decisions):
-            result = self._run_one(cursor, call, decision)
-            cursor.state.record_message(
+            result = self._run_one(state, call, decision)
+            state.record_message(
                 TOOL_RESULT,
                 Message(role="tool", text=result.output, tool_result=result),
                 key=call.name,
             )
 
-    def _run_one(self, cursor: _Cursor, call, decision) -> ToolResult:
+    def _run_one(self, state: RunState, call, decision) -> ToolResult:
         """Run one tool call, or report why it was refused."""
         with tracer.start_as_current_span(
             call.name, openinference_span_kind="tool"
@@ -339,94 +330,38 @@ class Agent:
                     if isinstance(decision, Replace)
                     else call.arguments
                 )
-                output = self.tools.dispatch(call.name, arguments, cursor.state)
+                output = self.tools.dispatch(call.name, arguments, state)
 
-            output = self.middleware.transform("after_tool", cursor.state, output, call)
+            output = self.middleware.transform("after_tool", state, output, call)
             span.set_output(output)
 
         return ToolResult(call_id=call.id, name=call.name, output=output)
 
-    def _finish(self, span, cursor: _Cursor, answer: str):
-        """Close a run: fire on_run_end once, stamp it, return.
+    # -- closing --------------------------------------------------------------
 
-        Distinct from on_model_stop, which also fires on the passes where a gate
-        sends the answer back. Fire-and-forget work belongs here, where the run
-        is genuinely over — and any decision it returns is ignored, because
-        there is nothing left to redirect.
+    def _finish(self, span, state: RunState, answer: str) -> str:
+        """Fire on_run_end once, stamp the run, return.
+
+        Distinct from on_model_stop, which also fires on passes where a gate
+        sends the answer back. Any decision returned here is ignored — there is
+        nothing left to redirect.
         """
-        state = cursor.state
         self.middleware.consult("on_run_end", state, answer)
         state.append("run", "run_finished", key=state.run_id, tokens=state.total_tokens)
         span.set_output(answer)
-        return answer, cursor.last_usage
-
-    # -- asking ----------------------------------------------------------------
-
-    def ask(
-        self,
-        session: "Session",
-        question: str,
-        files: list[str] | None = None,
-        max_turns: int = 10,
-    ) -> str:
-        """Ask one question in a session. What Conversation.ask used to be.
-
-        The agent acts; the session holds the state. That direction is why this
-        lives here rather than on Session — an Agent already takes a RunState,
-        and taking the session it belongs to is the same move one level up.
-
-        Nothing to hand back and forth: the answer goes onto the session's event
-        store as it is produced, so a caller cannot hold a stale history.
-        """
-        answer, _ = self.agentic_loop(
-            question, state=session.begin_run(question), max_turns=max_turns, files=files
-        )
         return answer
 
-    # -- resuming --------------------------------------------------------------
-
-    def resume(
-        self,
-        paused: RunPaused,
-        approved: bool,
-        note: str = "",
-        max_turns: int = 10,
-    ) -> tuple[str, Usage | None]:
-        """Answer a Pause and carry on.
-
-        The answer is stamped against the key the pause carried, so it applies
-        to that exact tool call and not to the next one that merely shares a
-        name. Middleware re-run on the way through and find the stamp waiting.
-        """
-        state = paused.state
-        state.append(
-            "on_resume",
-            "human_approved" if approved else "human_denied",
-            key=paused.key,
-            note=note,
-        )
-        human = HumanDecision(approved=approved, key=paused.key, note=note)
-        self.middleware.consult("on_resume", state, human)
-
-        return self.agentic_loop(
-            question=None,
-            max_turns=max_turns,
-            state=state,
-            pending=paused.pending,
-        )
-
     @staticmethod
-    def _record_tokens(span, prompt_tokens: int, completion_tokens: int) -> None:
-        """Roll the turn's token counts up onto the agent span.
+    def _record_tokens(span, state: RunState) -> None:
+        """Roll this run's token counts up onto the agent span.
 
-        The auto-instrumentation already records each call separately; what it
-        cannot show is what one user question cost in total, which is the
-        number that says whether context management is working.
+        Summed off the log rather than counted alongside it. The
+        auto-instrumentation already records each call; what it cannot show is
+        what one question cost in total.
         """
-        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, prompt_tokens)
-        span.set_attribute(
-            SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, completion_tokens
-        )
-        span.set_attribute(
-            SpanAttributes.LLM_TOKEN_COUNT_TOTAL, prompt_tokens + completion_tokens
-        )
+        store, run = state.event_store, state.run_id
+        prompt = store.sum("model_call", "input_tokens", run)
+        completion = store.sum("model_call", "output_tokens", run)
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, prompt)
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, completion)
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, prompt + completion)
