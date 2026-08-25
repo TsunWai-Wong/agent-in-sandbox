@@ -286,11 +286,18 @@ class SubAgentRegistry:
         self._background.clear()
         return results
 
-    def expose_as_tool(self, tools, name: str) -> None:
+    def expose_as_tool(self, tools, name: str, parallel_safe: bool = False) -> None:
         """Let the model delegate to a sub-agent by calling it.
 
         Only for sub-agents the model should CHOOSE. Never for a guardrail: one
         the model can call is one the model can decline.
+
+        parallel_safe lets two delegations in one batch overlap, which is worth
+        real wall-clock time — a sub-agent run is minutes of model latency. It
+        is a claim about the sub-agent's TOOLS, not its context: fresh context
+        is guaranteed by the spec's factory, but a specialist wired to the same
+        browser or the same sandbox workspace as its parent shares mutable
+        state with it and must stay sequential.
         """
         spec = self.get(name)
 
@@ -312,4 +319,9 @@ class SubAgentRegistry:
             "        starts fresh and sees none of this conversation.\n"
             "    context: Facts it needs that it cannot look up for itself.\n"
         )
-        tools.register(f"delegate_{name}", handler, wants_state=True)
+        tools.register(
+            f"delegate_{name}",
+            handler,
+            wants_state=True,
+            parallel_safe=parallel_safe,
+        )

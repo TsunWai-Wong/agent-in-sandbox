@@ -69,6 +69,11 @@ class Tool(BaseModel):
     # Whether dispatch should hand this handler the current RunState. Kept off
     # the generated schema so run plumbing never appears in what the model reads.
     wants_state: bool = False
+    # Whether two calls to this tool may run at the same time. Off by default,
+    # because the safe answer is the sequential one: a handler that shares a
+    # page, a workspace or a connection with the next call is the common case,
+    # and the cost of getting it wrong is a race rather than a slow answer.
+    parallel_safe: bool = False
 
 
 # The parameter a run-aware handler receives the RunState through. Excluded from
@@ -146,7 +151,13 @@ class ToolRegistry:
             },
         }
 
-    def register(self, name: str, handler: Callable, wants_state: bool = False):
+    def register(
+        self,
+        name: str,
+        handler: Callable,
+        wants_state: bool = False,
+        parallel_safe: bool = False,
+    ):
         """Register a callable, validating its generated schema first.
 
         Raises pydantic.ValidationError if the handler's signature or
@@ -157,6 +168,12 @@ class ToolRegistry:
         sub-agent tool needs the ledger for its depth check and its token
         rollup. The parameter is stripped from the schema, so the model is
         never offered it.
+
+        Set parallel_safe only for a handler with no shared mutable state and
+        no ordering dependency on its neighbours — a search, a fetch, a read.
+        It is a claim about the handler AND everything it reaches: a tool that
+        delegates to a sub-agent is only as parallel-safe as the tools that
+        sub-agent was given.
         """
         schema = self._read_tool(handler, wants_state)
         schema["name"] = name  # the registry name is authoritative for dispatch
@@ -166,7 +183,17 @@ class ToolRegistry:
             tool_schema=tool_schema,
             handler=handler,
             wants_state=wants_state,
+            parallel_safe=parallel_safe,
         )
+
+    def is_parallel_safe(self, name: str) -> bool:
+        """Whether this tool may share a batch with another call.
+
+        An unknown name is not parallel-safe: it runs sequentially and dispatch
+        reports it, rather than being hurried onto a thread to say so.
+        """
+        tool = self.tools.get(name)
+        return bool(tool and tool.parallel_safe)
 
     def get_schemas(self) -> list[ToolSchema]:
         """Return neutral schemas for the provider to convert."""

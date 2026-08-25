@@ -1,8 +1,10 @@
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from openinference.semconv.trace import SpanAttributes
+from opentelemetry import context as otel_context
 
 from monitoring import get_tracer
 
@@ -283,6 +285,10 @@ class Agent:
 
         before_tool cannot use _gate — Deny and Replace answer about one call,
         not the run, so they are collected rather than raised.
+
+        Consulting the whole batch up front is also what makes _execute safe to
+        parallelize: by the time anything runs, every pause has already been
+        raised, so no worker can pause a run from inside a thread.
         """
         decisions = []
         for call in response.tool_calls:
@@ -304,16 +310,72 @@ class Agent:
                 tool_calls=response.tool_calls,
             ),
         )
-        for call, decision in zip(response.tool_calls, decisions):
-            result = self._run_one(state, call, decision)
+        outputs = self._execute(state, response.tool_calls, decisions)
+
+        # after_tool and the recording both stay on this thread. Middleware
+        # write to the ledger, and results have to land in call order whatever
+        # order the batch finished in.
+        for call, output in zip(response.tool_calls, outputs):
+            output = self.middleware.transform("after_tool", state, output, call)
+            result = ToolResult(call_id=call.id, name=call.name, output=output)
             state.record_message(
                 TOOL_RESULT,
-                Message(role="tool", text=result.output, tool_result=result),
+                Message(role="tool", text=output, tool_result=result),
                 key=call.name,
             )
 
-    def _run_one(self, state: RunState, call, decision) -> ToolResult:
-        """Run one tool call, or report why it was refused."""
+    def _execute(self, state: RunState, calls: list, decisions: list) -> list[str]:
+        """Run the batch and return the raw outputs, one per call, in call order.
+
+        Tools registered parallel_safe share a pool; everything else runs here,
+        in order, alongside it. Returning a list rather than recording as it
+        goes is what keeps the transcript identical either way.
+        """
+        pooled = {
+            i
+            for i, call in enumerate(calls)
+            if self.tools.is_parallel_safe(call.name)
+        }
+        if len(pooled) < 2:
+            # Nothing to overlap. A single parallel-safe call gains nothing from
+            # a thread hop, and pays for the pool.
+            return [self._run_one(state, c, d) for c, d in zip(calls, decisions)]
+
+        outputs: list[str] = [""] * len(calls)
+        # Captured on this thread and attached inside each worker: OpenTelemetry
+        # context is thread-local, so without it the pooled tool spans orphan.
+        # Same reason SubAgentRegistry.spawn does it.
+        parent_context = otel_context.get_current()
+        with ThreadPoolExecutor(
+            max_workers=len(pooled), thread_name_prefix="tool"
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._run_pooled, parent_context, state, calls[i], decisions[i]
+                ): i
+                for i in pooled
+            }
+            for i, (call, decision) in enumerate(zip(calls, decisions)):
+                if i not in pooled:
+                    outputs[i] = self._run_one(state, call, decision)
+            for future, i in futures.items():
+                outputs[i] = future.result()
+        return outputs
+
+    def _run_pooled(self, parent_context, state: RunState, call, decision) -> str:
+        """_run_one on a pool thread, under the trace context of the run."""
+        token = otel_context.attach(parent_context)
+        try:
+            return self._run_one(state, call, decision)
+        finally:
+            otel_context.detach(token)
+
+    def _run_one(self, state: RunState, call, decision) -> str:
+        """Run one tool call, or report why it was refused.
+
+        Returns what the tool said, untransformed: after_tool belongs to the
+        caller, so that a middleware never runs on a pool thread.
+        """
         with tracer.start_as_current_span(
             call.name, openinference_span_kind="tool"
         ) as span:
@@ -332,10 +394,9 @@ class Agent:
                 )
                 output = self.tools.dispatch(call.name, arguments, state)
 
-            output = self.middleware.transform("after_tool", state, output, call)
             span.set_output(output)
 
-        return ToolResult(call_id=call.id, name=call.name, output=output)
+        return output
 
     # -- closing --------------------------------------------------------------
 
