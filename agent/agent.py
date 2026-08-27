@@ -25,9 +25,8 @@ from .skills import SkillRegistry
 from .tool_registry import ToolRegistry
 
 if TYPE_CHECKING:
-    # Type-only, and for UserMemoryStore that matters: memory/ imports agent/ at
-    # runtime, so a real import here would put a cycle one careless line away.
-    # The .search() call below is duck-typed.
+    # Type-only: memory/ imports agent/ at runtime, so a real import here would
+    # be a cycle. The .search() call below is duck-typed.
     from memory.memory_store import UserMemoryStore
 
     from .session import Session
@@ -41,30 +40,25 @@ class AgentLoopError(Exception):
 
 
 class RunPaused(Exception):
-    """A middleware asked for a human before the run may go on.
+    """A middleware wants a human before the run may go on.
 
-    Carries everything needed to resume — possibly in another process, hours
-    later — which is the whole reason middleware return decisions instead of
-    calling back. No thread is held while the answer is outstanding.
+    Carries everything needed to resume, possibly in another process hours
+    later. No thread is held while the answer is outstanding.
     """
 
     def __init__(self, state: RunState, pending: ChatResponse | None, decision: Pause):
         super().__init__(decision.question)
         # The state carries the event store, so the history rides along with it.
         self.state = state
-        # The model turn whose tools have not run yet, or None when the pause
-        # happened where nothing was waiting.
+        # The model turn whose tools have not run yet, or None when nothing waited.
         self.pending = pending
         self.question = decision.question
         self.key = decision.key
 
 
 class _Halted(Exception):
-    """Internal: a Stop decision, travelling the way a Pause does.
-
-    Stop and Pause both mean "this run does not carry on". Making them
-    symmetric is what lets a seam be one line. Never escapes run_loop.
-    """
+    """Internal: a Stop decision, travelling the way a Pause does, so that a
+    seam stays one line. Never escapes run_loop."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -84,14 +78,13 @@ class Agent:
     ):
         self.tools = tools
         self.llm = llm
-        # The instruction describes the agent, not a conversation, which is what
-        # lets one agent be shared while histories stay per session.
+        # Describes the agent, not a conversation: one agent can be shared while
+        # histories stay per session.
         self.context = ContextAssembler(instruction)
         self.skills = skills
         self.middleware = middleware or MiddlewareRegistry()
         self.memories = memories
-        # Whose memories. Not on RunState — a run does not own a user, a session
-        # does. Empty disables recall as surely as memories=None.
+        # Whose memories. Empty disables recall as surely as memories=None.
         self.user_id = user_id
 
     # -- entry points ---------------------------------------------------------
@@ -108,15 +101,14 @@ class Agent:
     ) -> str:
         """Run until the model produces a final text response.
 
-        Three ways to say which run this is, in precedence order:
+        Which run this is, in precedence order:
 
             state     an existing run — resuming, or a sub-agent's own
             session   a new run in this conversation
             neither   an ephemeral run, owned by nobody
 
-        Returns the answer alone. Everything else a caller might want — the
-        history, the token spend — is on the state's event store, where it
-        cannot be handed over stale.
+        Returns the answer alone. The history and the token spend stay on the
+        state's event store, where they cannot be handed over stale.
 
         Raises RunPaused when a middleware wants a human; pass it to resume().
         """
@@ -141,9 +133,9 @@ class Agent:
     ) -> str:
         """Answer a Pause and carry on.
 
-        The answer is stamped against the key the pause carried, so it applies
-        to that exact tool call and not to the next one sharing a name.
-        Middleware re-run on the way through and find the stamp waiting.
+        Stamped against the key the pause carried, so an approval applies to that
+        exact call and not to the next one sharing a name. Middleware re-run on
+        the way through and find the stamp waiting.
         """
         state = paused.state
         state.append(
@@ -172,14 +164,13 @@ class Agent:
     ) -> str:
         """The choreography: which seam fires, and when.
 
-        Deliberately the only place that names a seam. The mechanics live in the
-        helpers below so that which checkpoints exist, and in what order, stays
-        readable straight down this method.
+        Deliberately the only place that names a seam, so the checkpoints and
+        their order read straight down. The mechanics live in the helpers below.
         """
         if question is not None:
             state.record_message(USER_MESSAGE, self.llm.user_message(question, files))
-            # Gates see the question as text. Input guardrails match on what was
-            # written, and a parts list would silently stop every one of them.
+            # Gates see the question as text: a parts list would silently stop
+            # every input guardrail from matching.
             self._gate("on_run_start", state, question)
 
         tool_schemas = self.tools.get_schemas()
@@ -211,16 +202,16 @@ class Agent:
     def _gate(self, seam: str, state: RunState, *args) -> bool:
         """Fire one whole-run seam and act on the answer.
 
-        Continue and Inject are in-band. Stop and Pause are out-of-band, so both
-        leave by exception rather than as a value a caller could forget to check.
-        Returns whether something was injected.
+        Continue and Inject are in-band. Stop and Pause leave by exception, so a
+        caller cannot forget to check them. Returns whether something was
+        injected.
         """
         decision = self.middleware.consult(seam, state, *args)
         if isinstance(decision, (Stop, Deny)):
             raise _Halted(str(decision))
         if isinstance(decision, Pause):
-            # No pending here: every gate fires where a model turn is either
-            # already consumed or never started.
+            # No pending: every gate fires where a model turn is either already
+            # consumed or never started.
             raise RunPaused(state, None, decision)
         if isinstance(decision, Inject):
             state.record_message(
@@ -231,10 +222,8 @@ class Agent:
 
     def _call_model(self, state: RunState, tool_schemas: list, span) -> ChatResponse:
         """One model call, with the request rebuilt and the cost recorded."""
-        # Reassembled every call, not once before the loop: this is what makes
-        # load_skill take effect on the very next request rather than after the
-        # answer is already written. Same for the history, which a mid-run
-        # compaction may have just shortened.
+        # Reassembled every call, so a load_skill or a mid-run compaction takes
+        # effect on the very next request rather than after the answer is written.
         response = self.llm.chat(
             messages=self.context.build_messages(state.event_store),
             system=self.context.build_system_prompt(
@@ -244,10 +233,10 @@ class Agent:
             ),
             tools=tool_schemas,
         )
+
         usage = response.usage
-        # One line per call, so attempts and spend are derived from the log
-        # rather than counted. input_tokens separately, because it is the size of
-        # what the model was asked to read — the quantity ContextBudget acts on.
+        # One line per call, so attempts and spend are derived from the log rather
+        # than counted. input_tokens separately: it is what ContextBudget acts on.
         state.append(
             "before_model",
             "model_call",
@@ -255,15 +244,22 @@ class Agent:
             input_tokens=usage.input_tokens if usage else 0,
             output_tokens=usage.output_tokens if usage else 0,
         )
-        self._record_tokens(span, state)
+
+        # Summed off the log onto the agent span. Auto-instrumentation already
+        # records each call; what it cannot show is what one question cost.
+        store, run = state.event_store, state.run_id
+        prompt = store.sum("model_call", "input_tokens", run)
+        completion = store.sum("model_call", "output_tokens", run)
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, prompt)
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, completion)
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, prompt + completion)
         return response
 
     def _about_user(self, question: str) -> str | None:
         """The recall block, or None when there is nothing to say.
 
-        Retrieval is an upgrade to an answer, never a precondition for one, and
-        this runs inside every model call — so an unguarded query would turn a
-        database hiccup into a failed reply.
+        Guarded because this runs inside every model call: retrieval is an
+        upgrade to an answer, never a precondition for one.
         """
         if not (self.memories and self.user_id):
             return None
@@ -281,14 +277,11 @@ class Agent:
 
         Every call is consulted before any of it runs: a pause halfway would
         leave calls with no results, which every provider rejects on the next
-        request. So the batch is all-or-nothing and a resume replays it whole.
+        request. So the batch is all-or-nothing, a resume replays it whole, and
+        _execute is safe to parallelize — no worker can pause a run.
 
-        before_tool cannot use _gate — Deny and Replace answer about one call,
-        not the run, so they are collected rather than raised.
-
-        Consulting the whole batch up front is also what makes _execute safe to
-        parallelize: by the time anything runs, every pause has already been
-        raised, so no worker can pause a run from inside a thread.
+        before_tool cannot use _gate: Deny and Replace answer about one call, not
+        the run, so they are collected rather than raised.
         """
         decisions = []
         for call in response.tool_calls:
@@ -312,9 +305,8 @@ class Agent:
         )
         outputs = self._execute(state, response.tool_calls, decisions)
 
-        # after_tool and the recording both stay on this thread. Middleware
-        # write to the ledger, and results have to land in call order whatever
-        # order the batch finished in.
+        # after_tool and the recording both stay on this thread: middleware write
+        # to the ledger, and results land in call order however the batch ran.
         for call, output in zip(response.tool_calls, outputs):
             output = self.middleware.transform("after_tool", state, output, call)
             result = ToolResult(call_id=call.id, name=call.name, output=output)
@@ -325,36 +317,36 @@ class Agent:
             )
 
     def _execute(self, state: RunState, calls: list, decisions: list) -> list[str]:
-        """Run the batch and return the raw outputs, one per call, in call order.
+        """Run the batch, returning raw outputs one per call, in call order.
 
-        Tools registered parallel_safe share a pool; everything else runs here,
-        in order, alongside it. Returning a list rather than recording as it
-        goes is what keeps the transcript identical either way.
+        Tools registered parallel_safe share a pool; the rest run here, in order,
+        alongside it. Returning a list rather than recording as it goes is what
+        keeps the transcript identical either way.
         """
         pooled = {
-            i
-            for i, call in enumerate(calls)
-            if self.tools.is_parallel_safe(call.name)
+            i for i, call in enumerate(calls) if self.tools.is_parallel_safe(call.name)
         }
         if len(pooled) < 2:
-            # Nothing to overlap. A single parallel-safe call gains nothing from
-            # a thread hop, and pays for the pool.
+            # Nothing to overlap, and one call never repays the thread hop.
             return [self._run_one(state, c, d) for c, d in zip(calls, decisions)]
 
-        outputs: list[str] = [""] * len(calls)
-        # Captured on this thread and attached inside each worker: OpenTelemetry
-        # context is thread-local, so without it the pooled tool spans orphan.
-        # Same reason SubAgentRegistry.spawn does it.
+        # OTel context is thread-local: captured here, attached inside the worker,
+        # or the pooled tool spans orphan. Same reason SubAgentRegistry does it.
         parent_context = otel_context.get_current()
+
+        def run_pooled(i: int) -> str:
+            token = otel_context.attach(parent_context)
+            try:
+                return self._run_one(state, calls[i], decisions[i])
+            finally:
+                otel_context.detach(token)
+
+        outputs: list[str] = [""] * len(calls)
         with ThreadPoolExecutor(
             max_workers=len(pooled), thread_name_prefix="tool"
         ) as pool:
-            futures = {
-                pool.submit(
-                    self._run_pooled, parent_context, state, calls[i], decisions[i]
-                ): i
-                for i in pooled
-            }
+            # Submitted before anything runs here, so the pool starts at once.
+            futures = {pool.submit(run_pooled, i): i for i in pooled}
             for i, (call, decision) in enumerate(zip(calls, decisions)):
                 if i not in pooled:
                     outputs[i] = self._run_one(state, call, decision)
@@ -362,19 +354,11 @@ class Agent:
                 outputs[i] = future.result()
         return outputs
 
-    def _run_pooled(self, parent_context, state: RunState, call, decision) -> str:
-        """_run_one on a pool thread, under the trace context of the run."""
-        token = otel_context.attach(parent_context)
-        try:
-            return self._run_one(state, call, decision)
-        finally:
-            otel_context.detach(token)
-
     def _run_one(self, state: RunState, call, decision) -> str:
         """Run one tool call, or report why it was refused.
 
         Returns what the tool said, untransformed: after_tool belongs to the
-        caller, so that a middleware never runs on a pool thread.
+        caller, so a middleware never runs on a pool thread.
         """
         with tracer.start_as_current_span(
             call.name, openinference_span_kind="tool"
@@ -404,25 +388,10 @@ class Agent:
         """Fire on_run_end once, stamp the run, return.
 
         Distinct from on_model_stop, which also fires on passes where a gate
-        sends the answer back. Any decision returned here is ignored — there is
-        nothing left to redirect.
+        sends the answer back. Any decision here is ignored — nothing is left to
+        redirect.
         """
         self.middleware.consult("on_run_end", state, answer)
         state.append("run", "run_finished", key=state.run_id, tokens=state.total_tokens)
         span.set_output(answer)
         return answer
-
-    @staticmethod
-    def _record_tokens(span, state: RunState) -> None:
-        """Roll this run's token counts up onto the agent span.
-
-        Summed off the log rather than counted alongside it. The
-        auto-instrumentation already records each call; what it cannot show is
-        what one question cost in total.
-        """
-        store, run = state.event_store, state.run_id
-        prompt = store.sum("model_call", "input_tokens", run)
-        completion = store.sum("model_call", "output_tokens", run)
-        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, prompt)
-        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, completion)
-        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, prompt + completion)

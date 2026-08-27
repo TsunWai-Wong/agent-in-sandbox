@@ -21,7 +21,14 @@ from pydantic import BaseModel
 
 from agent.tool_registry import ToolSchema
 
-from .base import ChatResponse, Message, ToolCall, UnsupportedFile, Usage
+from .base import (
+    DEFAULT_TIMEOUT,
+    ChatResponse,
+    Message,
+    ToolCall,
+    UnsupportedFile,
+    Usage,
+)
 
 
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -30,24 +37,32 @@ IMAGE_SUFFIXES = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 )
 
-# Gemini raises one APIError carrying a status code rather than a class per
-# failure mode, so retryability is a code check rather than an isinstance —
-# which is exactly why the protocol asks for a predicate and not a tuple.
-RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
-
 
 class GeminiProvider:
     """Translate neutral Messages to and from google-genai."""
 
     default_model: str
 
-    def __init__(self, model: str | None = None, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        timeout: float | None = DEFAULT_TIMEOUT,
+    ) -> None:
         # Imported here, not at module scope: registry.py registers this class
         # at import time, and a top-level import would make the whole agent
         # package unimportable for anyone who has not installed the SDK.
         from google import genai
+        from google.genai import types
 
-        self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        # HttpOptions counts in milliseconds, where every other timeout in this
+        # package is in seconds.
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=int(timeout * 1000))
+            if timeout
+            else None,
+        )
         self.default_model = model or DEFAULT_MODEL
 
     def chat(
@@ -214,6 +229,3 @@ class GeminiProvider:
             parsed=getattr(response, "parsed", None),
             raw=response,
         )
-
-    def is_retryable(self, error: Exception) -> bool:
-        return getattr(error, "code", None) in RETRYABLE_STATUS

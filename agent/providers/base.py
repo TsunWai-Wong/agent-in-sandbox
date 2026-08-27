@@ -12,6 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.tool_registry import ToolSchema
 
 
+# Seconds before a request is abandoned. Defined here rather than on either
+# adapter because LLMService needs the same number when it builds a chain, and
+# importing it from an adapter would point the dependency the wrong way.
+DEFAULT_TIMEOUT = 60.0
+
+
 class UnsupportedFile(ValueError):
     """Raised for an attachment this provider cannot put on a message.
 
@@ -128,15 +134,20 @@ class ChatResponse(BaseModel):
 class Provider(Protocol):
     """What LLMService needs from a model provider.
 
-    Implementations translate and nothing else. Retries, backoff and logging
-    live in LLMService so they are written once instead of once per provider.
+    Implementations translate and nothing else. Retries, fallback, backoff and
+    logging live in LLMService so they are written once instead of once per
+    provider.
 
-    Three members, down from eight. History is neutral Messages now, so
-    building a user turn, appending a model turn, splitting at a turn boundary
-    and rendering a transcript are all provider-independent and moved out —
-    to the event store, which records them, and to ContextAssembler, which
-    shapes them. What is left here is genuinely per-vendor: the wire format,
-    and which errors are worth retrying.
+    Two members, down from eight. History is neutral Messages now, so building
+    a user turn, appending a model turn, splitting at a turn boundary and
+    rendering a transcript are all provider-independent and moved out — to the
+    event store, which records them, and to ContextAssembler, which shapes
+    them. Judging errors went the same way: providers/errors.py reads them for
+    the whole package, so is_retryable is gone too. What is left here is
+    genuinely per-vendor: the wire format.
+
+    Constructors take `model` and `timeout` and are called with nothing else,
+    since LLMService builds one adapter per entry in its chain.
 
     That is the whole reason for the neutral type. Adding mlx, vllm or
     OpenRouter is now a wire translation and nothing else.
@@ -161,14 +172,5 @@ class Provider(Protocol):
         system_instruction on the request config.
 
         Raises UnsupportedFile for an attachment kind this provider cannot send.
-        """
-        ...
-
-    def is_retryable(self, error: Exception) -> bool:
-        """Whether LLMService should retry after this error.
-
-        A predicate rather than a tuple of exception types: OpenAI raises a
-        distinct class per failure mode, while google-genai raises one APIError
-        carrying a status code, which no isinstance check can separate.
         """
         ...

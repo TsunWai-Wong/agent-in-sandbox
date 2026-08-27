@@ -22,12 +22,12 @@ from .event_store import HISTORY_SUMMARIZED, RunState
 from .middleware import CONTINUE, Decision, Middleware
 from .prompts import Prompt
 
+# Re-exported: the budget belongs to a model now, so it is defined beside the
+# chain, but callers have always imported it from here.
+from .providers.fallback import DEFAULT_TOKEN_BUDGET
+
 
 logger = logging.getLogger(__name__)
-
-# A cost ceiling, not the model's context limit — budgeting to the window would
-# mean never compacting until a question had already cost a fortune.
-DEFAULT_TOKEN_BUDGET = 60_000
 
 # One threshold, not two. Evicting tool traffic from older turns is
 # deterministic and free, so the assembler simply always does it. Only
@@ -48,12 +48,15 @@ class ContextBudget(Middleware):
     def __init__(
         self,
         llm,
-        token_budget: int = DEFAULT_TOKEN_BUDGET,
+        token_budget: int | None = None,
         compress_threshold: float = COMPRESS_THRESHOLD,
         keep_last_turns: int = KEEP_LAST_TURNS,
         summary_model: str | None = None,
     ):
         self.llm = llm
+        # None follows whichever model is next in the chain. Context windows
+        # differ down it, so one fixed ceiling is either wasteful on the big
+        # model or too generous for the small one.
         self.token_budget = token_budget
         self.compress_threshold = compress_threshold
         self.keep_last_turns = keep_last_turns
@@ -64,7 +67,8 @@ class ContextBudget(Middleware):
         # before making it — so the per-tool output cap bounds the overshoot.
         call = state.last("model_call")
         used = int(call.data.get("input_tokens", 0)) if call else 0
-        if used < self.token_budget * self.compress_threshold:
+        budget = self.token_budget or self.llm.token_budget
+        if used < budget * self.compress_threshold:
             return CONTINUE
 
         history = state.session_history()

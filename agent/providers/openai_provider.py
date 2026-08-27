@@ -5,13 +5,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import openai
 from openai import OpenAI
 from pydantic import BaseModel
 
 from agent.tool_registry import ToolSchema
 
 from .base import (
+    DEFAULT_TIMEOUT,
     ChatResponse,
     Message,
     ToolCall,
@@ -59,16 +59,6 @@ API_KEY = "not-needed"
 # started with or every request pays for a reload.
 DEFAULT_MODEL = "mlx-community/gemma-4-e2b-it-4bit"
 
-# The SDK raises typed exceptions instead of surfacing HTTP status codes:
-# 429 -> RateLimitError, 5xx -> InternalServerError, and network problems or
-# timeouts -> APIConnectionError. Anything else (401 auth, 400 bad request,
-# 404 model not found) is a caller bug and must not be retried.
-RETRYABLE_ERRORS = (
-    openai.RateLimitError,
-    openai.InternalServerError,
-    openai.APIConnectionError,
-)
-
 
 class OpenAIProvider:
     """Adapter for the OpenAI Chat Completions API.
@@ -83,13 +73,18 @@ class OpenAIProvider:
     client: OpenAI
     default_model: str
 
-    def __init__(self, model: str | None = None) -> None:
+    def __init__(
+        self, model: str | None = None, timeout: float | None = DEFAULT_TIMEOUT
+    ) -> None:
         # max_retries=0 disables the SDK's built-in retries so that the retry
-        # loop in LLMService is the only one running.
+        # loop in LLMService is the only one running. timeout=None means no
+        # limit at all, which is the SDK's reading of it and not an oversight:
+        # a call that hangs forever never reaches the next model in the chain.
         self.client = OpenAI(
             base_url=BASE_URL,
             api_key=API_KEY,
             max_retries=0,
+            timeout=timeout,
         )
         self.default_model = model or DEFAULT_MODEL
 
@@ -230,9 +225,6 @@ class OpenAIProvider:
             "image_url": {"url": f"data:{mime};base64,{encoded}"},
             FILENAME_KEY: path.name,
         }
-
-    def is_retryable(self, error: Exception) -> bool:
-        return isinstance(error, RETRYABLE_ERRORS)
 
     @staticmethod
     def _to_function_tool(schema: ToolSchema) -> dict:
