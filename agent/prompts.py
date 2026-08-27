@@ -181,6 +181,31 @@ that does not appear in the transcript.
 """
 
     @classmethod
+    def get_rewrite_instruction(cls):
+        """The rewriter produces search queries and nothing else.
+
+        The dominant failure is over-decomposition: a model told it may split
+        questions will split ones that did not need it, and each extra query
+        buys a search per backend for a worse ranking. Hence the second rule.
+        """
+        return """
+You turn a question into the search queries that will find documents answering
+it. You are not answering the question.
+
+Rules:
+- Make every query stand on its own. Resolve pronouns and references against
+  the conversation, so "its lyrics" becomes "<the song> lyrics".
+- Return ONE query unless the question genuinely asks for separate things. If
+  a single search could answer it, one query is the correct answer.
+- Split only what is separable: "compare X and Y" needs a query for each.
+- Prefer the words the documents would use. Expand an abbreviation only when
+  you are certain what it stands for.
+- If the question is already a good query, return it unchanged.
+
+Return only the queries, shortest first.
+"""
+
+    @classmethod
     def get_judge_instruction(cls):
        return """
 You are judging a song recommendation assistant.

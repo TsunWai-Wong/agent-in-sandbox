@@ -5,6 +5,24 @@ from .vector_search import VectorSearch
 
 tracer = get_tracer(__name__)
 
+# What a text_query template gets the current query substituted into.
+QUERY_PLACEHOLDER = "{query}"
+
+
+def fill_query(node, query: str):
+    """Put the query into a template body, wherever the placeholder sits.
+
+    Walks the dict rather than formatting a string, so a query containing a
+    quote or a brace cannot damage the body around it.
+    """
+    if isinstance(node, dict):
+        return {key: fill_query(value, query) for key, value in node.items()}
+    if isinstance(node, list):
+        return [fill_query(value, query) for value in node]
+    if isinstance(node, str):
+        return node.replace(QUERY_PLACEHOLDER, query)
+    return node
+
 class HybridSearch():
     text_searcher: TextSearch
     vector_searcher: VectorSearch
@@ -28,42 +46,54 @@ class HybridSearch():
         ranked = sorted(scores, key=scores.get, reverse=True)
         return [(docs[key], scores[key]) for key in ranked[:num_results]]
 
-    def hybrid_search(
+    def search(
         self,
-        query: str,
+        queries: list[str],
         text_query: dict,
         vector_query: str,
         num_results: int = 10,
     ) -> list[dict]:
-        """Search the corpus with combined full-text and semantic search.
+        """Search the corpus for every query and fuse the rankings into one.
 
-        Runs Elasticsearch full-text search and vector similarity search,
-        then merges both rankings with Reciprocal Rank Fusion.
+        Each query runs against both Elasticsearch and the vector store, and all
+        the rankings go into a single Reciprocal Rank Fusion. Fusing rather than
+        concatenating is what makes decomposition worth it: a document several
+        queries agree on outranks one that only the best query found.
+
+        One query is the one-element case, so there is nothing else to call.
 
         Args:
-            query: Natural-language description of the documents to find.
-            text_query: Elasticsearch query body. Its `size` is replaced with
-                the pool size, so both rankings are fused over equal depth.
+            queries: The queries to run. Usually from a QueryRewriter.
+            text_query: Elasticsearch query body, with "{query}" wherever the
+                query text belongs — it is filled in per query, so each one
+                searches for itself rather than all of them repeating the first.
+                Its `size` is replaced with the pool size, so every ranking is
+                fused over equal depth.
             vector_query: Nearest-neighbour statement for the vector store.
             num_results: Maximum number of documents to return.
         """
         with tracer.start_as_current_span(
             "hybrid_search", openinference_span_kind="chain"
         ) as span:
-            span.set_input(query)
+            span.set_input(queries)
             pool_size = max(2 * num_results, 10)
             span.set_attribute("retriever.pool_size", pool_size)
+            span.set_attribute("retriever.num_queries", len(queries))
 
-            text_results = self.text_searcher.text_search(
-                {**text_query, "size": pool_size}
-            )
-            vector_results = self.vector_searcher.vector_search(
-                query, vector_query, num_results=pool_size
-            )
+            rankings = []
+            for query in queries:
+                rankings.append(
+                    self.text_searcher.text_search(
+                        {**fill_query(text_query, query), "size": pool_size}
+                    )
+                )
+                rankings.append(
+                    self.vector_searcher.vector_search(
+                        query, vector_query, num_results=pool_size
+                    )
+                )
 
-            fused = self._rrf(
-                [text_results, vector_results], num_results=num_results
-            )
+            fused = self._rrf(rankings, num_results=num_results)
             documents = [document for document, _ in fused]
             set_documents(span, documents, scores=[score for _, score in fused])
             return documents
